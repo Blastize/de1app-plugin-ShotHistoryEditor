@@ -61,7 +61,11 @@ set plugin_name "ShotHistoryEditor"
 namespace eval ::plugins::ShotHistoryEditor {
     variable author      "Blastize"
     variable contact     "n/a"
-    variable version     "v0.5.4"
+    # No "v" prefix in the VALUE. The startup message below prepends one, so a
+    # prefixed value logged as "vv0.6.3" (v0.6.4). Every other plugin on the
+    # tablet stores a bare number here too; the core only reads this variable
+    # to decide whether the plugin's metadata loaded, and never displays it.
+    variable version     "0.7.1"
     variable name        "Shot History Editor"
     variable description "Card-based shot browser with real metadata save and soft delete (move to trash, restorable) for DE1app shot history."
 

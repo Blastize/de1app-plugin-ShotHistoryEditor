@@ -765,6 +765,66 @@ proc ::plugins::ShotHistoryEditor::_apply_edit_overlay {row overlays} {
 # `file delete`: a failed pre-rename verification simply leaves the temp
 # file behind (harmless, and the original was never touched); a failed
 # post-rename verification restores via `file rename` from the backup.
+# Tell Grind Advisor that this plugin changed what is on disk, so its
+# recommendation follows without anyone having to know that it should. Its
+# refresh_from_history asks SDB to resync, drops its per-bag cache, recomputes
+# for the loaded bag and re-saves. Returns its human-readable summary, or ""
+# when it is not installed or the call failed.
+#
+# Guarded on both existence and errors: by the time this is called THIS
+# plugin's own work has already succeeded, and it must report success whatever
+# another plugin does.
+#
+# Answering the obvious question -- why not refresh on every recommendation
+# lookup instead? Because the resync rescans the whole history folder. Once
+# per edit or per delete batch is the right moment to spend that; a display
+# tick is not.
+#
+# v0.6.3: this was inline in perform_metadata_edit and nowhere else, so an
+# edit updated the recommendation and a DELETE did not -- owner-reported from
+# the tablet, the same symptom as the v0.6.0 edit bug and the same cause one
+# path over. Deleting needs no mtime trick, unlike editing: SDB's populate
+# flags a vanished file `removed=1` by absence alone, and Grind Advisor
+# already filters that column in its SQL. The notification was the only
+# missing link. Kept as ONE proc so the three paths cannot drift apart.
+#
+# `what` is a short phrase for the log line, e.g. "the edit", "the delete".
+proc ::plugins::ShotHistoryEditor::_refresh_grind_advisor {what} {
+    if {[info procs ::plugins::GrindAdvisor::refresh_from_history] eq ""} { return "" }
+    set note ""
+    if {[catch { set note [::plugins::GrindAdvisor::refresh_from_history] } err]} {
+        catch { msg -NOTICE "ShotHistoryEditor: Grind Advisor refresh failed after $what: $err" }
+        return ""
+    }
+    catch { msg -INFO "ShotHistoryEditor: Grind Advisor refreshed after $what: $note" }
+    return $note
+}
+
+# Everything downstream that should follow a change to history/, in order
+# (v0.7.0). Called wherever _refresh_grind_advisor used to be called alone.
+#
+#   1. Grind Advisor first: its refresh_from_history resyncs SDB, which the
+#      next step reads.
+#   2. The Lumen skin second: refresh_after_history_change reloads the home
+#      page's last-shot chart and card from the (possibly new) newest shot
+#      file, and rebuilds the bag cycler from the freshly-resynced SDB.
+#
+# Each is guarded on existence -- a different skin, or no Grind Advisor,
+# simply skips its step -- and on errors, because this plugin's own work has
+# already succeeded by the time this runs. Returns Grind Advisor's summary
+# for the result pages, same contract as _refresh_grind_advisor.
+proc ::plugins::ShotHistoryEditor::_notify_downstream {what} {
+    set note [_refresh_grind_advisor $what]
+    if {[info procs ::lumen::refresh_after_history_change] ne ""} {
+        if {[catch { ::lumen::refresh_after_history_change } err]} {
+            catch { msg -NOTICE "ShotHistoryEditor: Lumen refresh failed after $what: $err" }
+        } else {
+            catch { msg -INFO "ShotHistoryEditor: Lumen home refreshed after $what" }
+        }
+    }
+    return $note
+}
+
 proc ::plugins::ShotHistoryEditor::perform_metadata_edit {filename field new_value} {
     variable editable_fields
 
@@ -873,9 +933,44 @@ proc ::plugins::ShotHistoryEditor::perform_metadata_edit {filename field new_val
             old_value $old_value new_value $new_value backup_path $backup_path]
     }
 
+    # v0.6.0: make the file LOOK modified, because it is.
+    #
+    # MEASURED ON THE TABLET, 2026-08-19. The 16:44:30 shot was edited at
+    # 16:45:30 (grinder_setting 7.5 -> 8; the edit_log records it and the file
+    # does contain 8). Its modification time was still 1787057093 = 16:44:53 --
+    # the moment the app first WROTE the shot. `file rename` landed the
+    # replacement carrying the original's timestamp: Tcl's rename falls back
+    # to a copy on this storage, and Tcl's copy preserves file times.
+    #
+    # That silently defeats every consumer that detects edits by mtime.
+    # SDB re-reads a .shot only when `file mtime > file_modification_date`
+    # (SDB.tcl:2060), and SDB's stored value for that shot was 1787057093 --
+    # byte-identical to the file's. Not greater, so it was skipped, and would
+    # have been skipped forever. Confirmed by reading SDB read-only: the row
+    # still said grinder_setting '7.5' while the file said 8.
+    #
+    # So SDB's OWN "Resync database to history" button could never pick up an
+    # edit made by this plugin, and neither could anything downstream of it --
+    # which is exactly what the owner reported about Grind Advisor.
+    #
+    # One `file mtime` stamp on the file this proc has just legitimately
+    # rewritten. No content is touched. It is deliberately AFTER the
+    # post-rename verification, so a save that failed verification and was
+    # rolled back never stamps anything.
+    if {[catch { file mtime $path [clock seconds] } err]} {
+        catch { msg -NOTICE "ShotHistoryEditor: could not stamp the modification time of $path: $err (SDB will not see this edit until it is resynced another way)" }
+    }
+
     _append_edit_manifest $ts $filename $field $old_value $new_value $backup_path
     _append_edit_log $ts $filename $field $old_value $new_value $backup_path "OK"
-    return [dict create ok 1 message "" old_value $old_value new_value $new_value backup_path $backup_path]
+
+    # v0.6.0: tell Grind Advisor, so the recommendation follows the correction
+    # without anyone having to know that it should. v0.6.3 shared that with
+    # the delete and restore paths; v0.7.0 widened it to the Lumen home page.
+    set note [_notify_downstream "the edit"]
+
+    return [dict create ok 1 message "" old_value $old_value new_value $new_value \
+        backup_path $backup_path refresh_note $note]
 }
 
 # SQL string-literal quoting (distinct from _q, which quotes identifiers).
@@ -1063,9 +1158,16 @@ proc ::plugins::ShotHistoryEditor::perform_delete_batch {filenames} {
             foreach pm $pair_moved { lappend moved $pm }
             lappend failed [dict create filename $fn reason "move failed: $move_err"]
             _append_manifest_and_log $moved $batch_id $ts $shot_count
+            # Some files DID move before the stop, so the history folder has
+            # changed and the recommendation is stale even though this batch
+            # failed. Refresh on exactly that condition (v0.6.3).
+            set note ""
+            if {[llength $moved] > 0} {
+                set note [_notify_downstream "a partial delete"]
+            }
             return [dict create ok 0 message "A file move failed partway through the batch; stopped." \
                 moved_files [llength $moved] shot_count $shot_count failed $failed batch_id $batch_id \
-                trash_path $batch_dir]
+                trash_path $batch_dir refresh_note $note]
         }
 
         foreach pm $pair_moved { lappend moved $pm }
@@ -1073,8 +1175,17 @@ proc ::plugins::ShotHistoryEditor::perform_delete_batch {filenames} {
     }
 
     _append_manifest_and_log $moved $batch_id $ts $shot_count
+
+    # v0.6.3: the deleted shots must stop counting towards the grind
+    # recommendation. Once per batch, after the manifest is written -- never
+    # per file, and never before, so a batch that moved nothing asks SDB for
+    # nothing.
+    set note ""
+    if {[llength $moved] > 0} {
+        set note [_notify_downstream "the delete"]
+    }
     return [dict create ok 1 message "" moved_files [llength $moved] shot_count $shot_count \
-        failed $failed batch_id $batch_id trash_path $batch_dir]
+        failed $failed batch_id $batch_id trash_path $batch_dir refresh_note $note]
 }
 
 # Moves every file in a trash batch back to its original path. Move only --
@@ -1109,12 +1220,36 @@ proc ::plugins::ShotHistoryEditor::restore_batch {batch_id} {
             lappend keep $rec
         } else {
             incr restored
+            # v0.7.1: stamp the restored file's modification time -- the
+            # same mechanism the edit path has used since v0.6.0, for the
+            # same reason. `file rename` preserves the original mtime, and
+            # SDB's populate only re-reads a file whose mtime is NEWER than
+            # the one it stored. Normally that is harmless (the row already
+            # matches the file), but if the path was rewritten while the
+            # shot sat in trash -- seen for real on 2026-08-24, when the
+            # core's flush-save bug parked a corpse under a restored shot's
+            # name -- SDB has stored the REWRITE's metadata, and the
+            # restored original's older mtime stops it from ever being
+            # re-read. Stamping makes the resync (which _notify_downstream
+            # triggers right after this loop) pick up the restored truth
+            # unconditionally.
+            if {[catch { file mtime $orig [clock seconds] } err]} {
+                catch { msg -NOTICE "ShotHistoryEditor: could not stamp the modification time of $orig: $err (SDB may keep older metadata for this shot until it is resynced another way)" }
+            }
         }
     }
 
     _rewrite_manifest $keep
     _append_restore_log $batch_id $restored $collisions
-    return [dict create restored $restored collisions $collisions]
+
+    # v0.6.3: the same gap in reverse. A restored shot must start counting
+    # again -- SDB's populate clears `removed` for a file that has reappeared,
+    # so this needs no special handling beyond asking for the resync.
+    set note ""
+    if {$restored > 0} {
+        set note [_notify_downstream "the restore"]
+    }
+    return [dict create restored $restored collisions $collisions refresh_note $note]
 }
 
 proc ::plugins::ShotHistoryEditor::_close_db {} {
@@ -1630,7 +1765,18 @@ proc ::plugins::ShotHistoryEditor::confirm_save_submit {} {
     lappend lines ""
     lappend lines "Backup: [dict get $result backup_path]"
     lappend lines ""
-    lappend lines "SDB and history_v2 are unchanged; the card list and Detail page overlay this correction until SDB resyncs on its own."
+    # v0.6.0: the file's modification time is stamped on a successful save, so
+    # SDB's own resync can finally see the edit -- before this, an edited shot
+    # kept the timestamp it was first written with and SDB skipped it forever.
+    # Grind Advisor is refreshed straight afterwards when it is installed.
+    lappend lines "This plugin still writes nothing but history/<shot>.shot. history_v2 is unchanged."
+    set note ""
+    catch { set note [dict get $result refresh_note] }
+    if {$note ne ""} {
+        lappend lines "Grind Advisor: $note"
+    } else {
+        lappend lines "SDB is not written to directly; the card list overlays this correction until SDB resyncs."
+    }
     set edit_result_text [join $lines "\n"]
 
     open_page ShotHistoryEditor_edit_result
@@ -2352,6 +2498,17 @@ proc ::plugins::ShotHistoryEditor::confirm_delete_submit {} {
         }
     }
     lappend lines ""
+    # v0.6.3: say whether the recommendation was recomputed, the same way the
+    # edit result page does. Before this the deleted shots kept counting
+    # towards the grind recommendation and nothing on screen said so.
+    set note ""
+    catch { set note [dict get $result refresh_note] }
+    if {$note ne ""} {
+        lappend lines "Grind Advisor: $note"
+    } else {
+        lappend lines "SDB is not written to directly; the card list overlays this until SDB resyncs."
+    }
+    lappend lines ""
     lappend lines "Nothing was permanently deleted. Use Advanced > Trash / Restore to undo."
     set delete_result_text [join $lines "\n"]
 
@@ -2705,7 +2862,11 @@ namespace eval ::dui::pages::ShotHistoryEditor_delete_review {
 
         set right_btn_x1 [expr {$rx-$L(btn_w_std)}]
         set left_btn_x1 [expr {$right_btn_x1-$L(sm)-$L(btn_w_std)}]
-        dui add dbutton $page $left_btn_x1 $L(bar_y0) [expr {$left_btn_x1+$L(btn_w_std)}] $L(bar_y1) -tags cancel \
+        # v0.6.2: Cancel to the far left, with the delete flow's forward
+        # button left where it is. Same reasoning as the edit flow: the way
+        # OUT is always the bottom-left corner, and the destructive button is
+        # never under the thumb that keeps tapping there.
+        dui add dbutton $page $lx $L(bar_y0) [expr {$lx+$L(btn_w_std)}] $L(bar_y1) -tags cancel \
             -label [translate "Cancel"] -command ::plugins::ShotHistoryEditor::cancel_delete_review \
             -label_font $L(font_button) -style she_btn
         dui add dbutton $page $right_btn_x1 $L(bar_y0) $rx $L(bar_y1) -tags continue_btn \
@@ -2742,7 +2903,8 @@ namespace eval ::dui::pages::ShotHistoryEditor_delete_confirm {
 
         set right_btn_x1 [expr {$rx-$L(btn_w_std)}]
         set left_btn_x1 [expr {$right_btn_x1-$L(sm)-$L(btn_w_std)}]
-        dui add dbutton $page $left_btn_x1 $L(bar_y0) [expr {$left_btn_x1+$L(btn_w_std)}] $L(bar_y1) -tags cancel \
+        # v0.6.2: Cancel to the far left; Delete stays on the right.
+        dui add dbutton $page $lx $L(bar_y0) [expr {$lx+$L(btn_w_std)}] $L(bar_y1) -tags cancel \
             -label [translate "Cancel"] -command ::plugins::ShotHistoryEditor::cancel_delete_confirm \
             -label_font $L(font_button) -style she_btn
         dui add dbutton $page $right_btn_x1 $L(bar_y0) $rx $L(bar_y1) -tags confirm_delete \
@@ -2768,7 +2930,9 @@ namespace eval ::dui::pages::ShotHistoryEditor_delete_result {
         dui add dtext $page $lx $L(list_top) -tags result_text -text "" \
             -font $L(font_body) -width $L(content_w) -fill "#444444" -anchor nw -justify left
 
-        dui add dbutton $page [expr {$rx-$L(btn_w_std)}] $L(bar_y0) $rx $L(bar_y1) -tags page_done \
+        # v0.6.2: Done at the FAR LEFT, like every other page in this plugin
+        # now and like the card list it returns to.
+        dui add dbutton $page $lx $L(bar_y0) [expr {$lx+$L(btn_w_std)}] $L(bar_y1) -tags page_done \
             -label [translate "Done"] -command ::plugins::ShotHistoryEditor::close_delete_result \
             -label_font $L(font_button) -style she_btn
     }
@@ -2801,12 +2965,17 @@ namespace eval ::dui::pages::ShotHistoryEditor_edit_confirm {
         dui add dtext $page $lx [expr {$L(toolbar_y0)+5*$L(lg)}] -tags confirm_warning_text -text "" \
             -font $L(font_caption) -width $L(content_w) -fill "#7a4b00" -anchor nw -justify left
 
-        set right_btn_x1 [expr {$rx-$L(btn_w_std)}]
-        set left_btn_x1 [expr {$right_btn_x1-$L(sm)-$L(btn_w_std)}]
-        dui add dbutton $page $left_btn_x1 $L(bar_y0) [expr {$left_btn_x1+$L(btn_w_std)}] $L(bar_y1) -tags cancel \
+        # v0.6.2: Cancel takes the far-left slot -- it is this page's way out,
+        # the same role Done plays everywhere else, so backing out of the
+        # whole flow is the same corner every time.
+        #
+        # Save Change deliberately does NOT move. It is the destructive
+        # button, and the one place it must not be is under the thumb that is
+        # tapping bottom-left repeatedly to leave.
+        dui add dbutton $page $lx $L(bar_y0) [expr {$lx+$L(btn_w_std)}] $L(bar_y1) -tags cancel \
             -label [translate "Cancel"] -command ::plugins::ShotHistoryEditor::cancel_edit_confirm \
             -label_font $L(font_button) -style she_btn
-        dui add dbutton $page $right_btn_x1 $L(bar_y0) $rx $L(bar_y1) -tags save_change \
+        dui add dbutton $page [expr {$rx-$L(btn_w_std)}] $L(bar_y0) $rx $L(bar_y1) -tags save_change \
             -label [translate "Save Change"] -label_fill "#c0392b" \
             -command ::plugins::ShotHistoryEditor::confirm_save_submit \
             -label_font $L(font_button) -style she_btn
@@ -2829,7 +2998,10 @@ namespace eval ::dui::pages::ShotHistoryEditor_edit_result {
         dui add dtext $page $lx $L(list_top) -tags edit_result_text -text "" \
             -font $L(font_body) -width $L(content_w) -fill "#444444" -anchor nw -justify left
 
-        dui add dbutton $page [expr {$rx-$L(btn_w_std)}] $L(bar_y0) $rx $L(bar_y1) -tags page_done \
+        # v0.6.2: Done at the FAR LEFT. This is the page you land on after
+        # saving, so it is the one whose Done gets tapped straight after
+        # another one.
+        dui add dbutton $page $lx $L(bar_y0) [expr {$lx+$L(btn_w_std)}] $L(bar_y1) -tags page_done \
             -label [translate "Done"] -command ::plugins::ShotHistoryEditor::close_edit_result \
             -label_font $L(font_button) -style she_btn
     }
@@ -2872,17 +3044,20 @@ namespace eval ::dui::pages::ShotHistoryEditor_trash {
             set y [expr {$y+$row_h}]
         }
 
-        set right_btn_x1 [expr {$rx-$L(btn_w_std)}]
-        set left_btn_x1 [expr {$right_btn_x1-$L(sm)-$L(btn_w_std)}]
-        set prev_x1 [expr {$left_btn_x1-$L(sm)-$L(btn_w_std)}]
-        dui add dbutton $page $prev_x1 $L(bar_y0) [expr {$prev_x1+$L(btn_w_std)}] $L(bar_y1) -tags trash_prev_page \
-            -label [translate "◀ Prev"] -command {::plugins::ShotHistoryEditor::scroll_trash -1} \
+        # v0.6.2: Done leads the row from the far left; Back and the pager
+        # keep their order behind it.
+        set bw $L(btn_w_std)
+        set x $lx
+        dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags page_done \
+            -label [translate "Done"] -command ::dui::pages::ShotHistoryEditor_trash::page_done \
             -label_font $L(font_button) -style she_btn
-        dui add dbutton $page $left_btn_x1 $L(bar_y0) [expr {$left_btn_x1+$L(btn_w_std)}] $L(bar_y1) -tags back \
+        incr x [expr {$bw+$L(sm)}]
+        dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags back \
             -label [translate "Back"] -command {::plugins::ShotHistoryEditor::open_page ShotHistoryEditor_advanced} \
             -label_font $L(font_button) -style she_btn
-        dui add dbutton $page $right_btn_x1 $L(bar_y0) $rx $L(bar_y1) -tags page_done \
-            -label [translate "Done"] -command ::dui::pages::ShotHistoryEditor_trash::page_done \
+        incr x [expr {$bw+$L(sm)}]
+        dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags trash_prev_page \
+            -label [translate "◀ Prev"] -command {::plugins::ShotHistoryEditor::scroll_trash -1} \
             -label_font $L(font_button) -style she_btn
     }
 
@@ -2936,13 +3111,14 @@ namespace eval ::dui::pages::ShotHistoryEditor_recent {
             set y [expr {$y+$row_h}]
         }
 
-        set right_btn_x1 [expr {$rx-$L(btn_w_std)}]
-        set left_btn_x1 [expr {$right_btn_x1-$L(sm)-$L(btn_w_std)}]
-        dui add dbutton $page $left_btn_x1 $L(bar_y0) [expr {$left_btn_x1+$L(btn_w_std)}] $L(bar_y1) -tags back \
-            -label [translate "Back"] -command {::plugins::ShotHistoryEditor::open_page ShotHistoryEditor_advanced} \
-            -label_font $L(font_button) -style she_btn
-        dui add dbutton $page $right_btn_x1 $L(bar_y0) $rx $L(bar_y1) -tags page_done \
+        # v0.6.2: Done at the far left, Back beside it.
+        set bw $L(btn_w_std)
+        dui add dbutton $page $lx $L(bar_y0) [expr {$lx+$bw}] $L(bar_y1) -tags page_done \
             -label [translate "Done"] -command ::dui::pages::ShotHistoryEditor_recent::page_done \
+            -label_font $L(font_button) -style she_btn
+        set back_x [expr {$lx+$bw+$L(sm)}]
+        dui add dbutton $page $back_x $L(bar_y0) [expr {$back_x+$bw}] $L(bar_y1) -tags back \
+            -label [translate "Back"] -command {::plugins::ShotHistoryEditor::open_page ShotHistoryEditor_advanced} \
             -label_font $L(font_button) -style she_btn
     }
 
@@ -2972,7 +3148,15 @@ namespace eval ::dui::pages::ShotHistoryEditor_detail {
             -font $L(font_caption) -width $L(content_w) -fill "#444444" -anchor nw -justify left
 
         set bw $L(btn_w_std)
+        # v0.6.2: Done leads, then Back / Prev / Next in their existing order,
+        # and Edit Metadata Preview still fills the rest of the bar. Every
+        # button keeps the width it had -- the wide one included, since it
+        # gains on the right exactly what the row lost on the left.
         set x $lx
+        dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags page_done \
+            -label [translate "Done"] -command ::dui::pages::ShotHistoryEditor_detail::page_done \
+            -label_font $L(font_button) -style she_btn
+        incr x [expr {$bw+$L(sm)}]
         dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags back \
             -label [translate "Back"] -command {::plugins::ShotHistoryEditor::open_page ShotHistoryEditor_recent} \
             -label_font $L(font_button) -style she_btn
@@ -2985,11 +3169,8 @@ namespace eval ::dui::pages::ShotHistoryEditor_detail {
             -label [translate "Next"] -command {::plugins::ShotHistoryEditor::scroll_page detail 1 ShotHistoryEditor_detail} \
             -label_font $L(font_button) -style she_btn
         incr x [expr {$bw+$L(sm)}]
-        dui add dbutton $page $x $L(bar_y0) [expr {$rx-$bw-$L(sm)}] $L(bar_y1) -tags edit_preview \
+        dui add dbutton $page $x $L(bar_y0) $rx $L(bar_y1) -tags edit_preview \
             -label [translate "Edit Metadata Preview"] -command {::plugins::ShotHistoryEditor::open_edit_preview ShotHistoryEditor_detail} \
-            -label_font $L(font_button) -style she_btn
-        dui add dbutton $page [expr {$rx-$bw}] $L(bar_y0) $rx $L(bar_y1) -tags page_done \
-            -label [translate "Done"] -command ::dui::pages::ShotHistoryEditor_detail::page_done \
             -label_font $L(font_button) -style she_btn
     }
 
@@ -3060,13 +3241,26 @@ namespace eval ::dui::pages::ShotHistoryEditor_edit_preview {
         dui add dtext $page $lx [expr {$status_y+$L(xl)}] -tags preview_text -text "" \
             -font $L(font_caption) -width $L(content_w) -fill "#444444" -anchor nw -justify left
 
-        set right_btn_x1 [expr {$rx-$L(btn_w_std)}]
-        set left_btn_x1 [expr {$right_btn_x1-$L(sm)-$L(btn_w_std)}]
-        dui add dbutton $page $left_btn_x1 $L(bar_y0) [expr {$left_btn_x1+$L(btn_w_std)}] $L(bar_y1) -tags back \
-            -label [translate "Back"] -command ::plugins::ShotHistoryEditor::back_from_edit_preview \
-            -label_font $L(font_button) -style she_btn
-        dui add dbutton $page $right_btn_x1 $L(bar_y0) $rx $L(bar_y1) -tags page_done \
+        # v0.6.1, owner request: Done sits at the FAR LEFT on this page, not
+        # the far right.
+        #
+        # This page's Done returns to the card list, whose own Done is the
+        # bar's left button (bar_left, and the design system's "Done left /
+        # Advanced right"). With Done here on the right, leaving the editor
+        # meant tapping the bottom-right corner and then the bottom-LEFT one.
+        # Aligned, it is the same spot twice.
+        #
+        # Back keeps its place beside Done rather than moving to the far
+        # right: on this page the two run the identical command
+        # (page_done reuses back_from_edit_preview), so separating them across
+        # the bar would suggest a difference that does not exist.
+        set done_x1 $lx
+        set back_x1 [expr {$done_x1+$L(btn_w_std)+$L(sm)}]
+        dui add dbutton $page $done_x1 $L(bar_y0) [expr {$done_x1+$L(btn_w_std)}] $L(bar_y1) -tags page_done \
             -label [translate "Done"] -command ::dui::pages::ShotHistoryEditor_edit_preview::page_done \
+            -label_font $L(font_button) -style she_btn
+        dui add dbutton $page $back_x1 $L(bar_y0) [expr {$back_x1+$L(btn_w_std)}] $L(bar_y1) -tags back \
+            -label [translate "Back"] -command ::plugins::ShotHistoryEditor::back_from_edit_preview \
             -label_font $L(font_button) -style she_btn
     }
 
@@ -3096,8 +3290,10 @@ namespace eval ::dui::pages::ShotHistoryEditor_diagnostics {
         dui add dtext $page $lx $L(list_top) -tags diagnostics_text -text "" \
             -font $L(font_caption) -width $L(content_w) -fill "#444444" -anchor nw -justify left
 
+        # v0.6.2: the row starts one slot in, because Done now occupies the
+        # far-left slot (added at the end of this block).
         set bw $L(btn_w_std)
-        set x $lx
+        set x [expr {$lx+$bw+$L(sm)}]
         dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags back \
             -label [translate "Back"] -command {::plugins::ShotHistoryEditor::open_page ShotHistoryEditor_advanced} \
             -label_font $L(font_button) -style she_btn
@@ -3109,7 +3305,10 @@ namespace eval ::dui::pages::ShotHistoryEditor_diagnostics {
         dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags next_page \
             -label [translate "Next"] -command {::plugins::ShotHistoryEditor::scroll_page diagnostics 1 ShotHistoryEditor_diagnostics} \
             -label_font $L(font_button) -style she_btn
-        dui add dbutton $page [expr {$rx-$bw}] $L(bar_y0) $rx $L(bar_y1) -tags page_done \
+        # v0.6.2: Done moved from the far right to the far left. It is added
+        # last but positioned first, so Back/Prev/Next keep the x values they
+        # already had and only Done changes place.
+        dui add dbutton $page $lx $L(bar_y0) [expr {$lx+$bw}] $L(bar_y1) -tags page_done \
             -label [translate "Done"] -command ::dui::pages::ShotHistoryEditor_diagnostics::page_done \
             -label_font $L(font_button) -style she_btn
     }
@@ -3141,8 +3340,10 @@ namespace eval ::dui::pages::ShotHistoryEditor_help {
         dui add dtext $page $lx $L(list_top) -tags help_text -text "" \
             -font $L(font_body) -width $L(content_w) -fill "#444444" -anchor nw -justify left
 
+        # v0.6.2: the row starts one slot in, because Done now occupies the
+        # far-left slot (added at the end of this block).
         set bw $L(btn_w_std)
-        set x $lx
+        set x [expr {$lx+$bw+$L(sm)}]
         dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags back \
             -label [translate "Back"] -command {::plugins::ShotHistoryEditor::open_page ShotHistoryEditor_advanced} \
             -label_font $L(font_button) -style she_btn
@@ -3154,7 +3355,9 @@ namespace eval ::dui::pages::ShotHistoryEditor_help {
         dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags next_page \
             -label [translate "Next"] -command {::plugins::ShotHistoryEditor::scroll_page help 1 ShotHistoryEditor_help} \
             -label_font $L(font_button) -style she_btn
-        dui add dbutton $page [expr {$rx-$bw}] $L(bar_y0) $rx $L(bar_y1) -tags page_done \
+        # v0.6.2: Done moved from the far right to the far left. Added last,
+        # positioned first, so the other three keep their existing x values.
+        dui add dbutton $page $lx $L(bar_y0) [expr {$lx+$bw}] $L(bar_y1) -tags page_done \
             -label [translate "Done"] -command ::dui::pages::ShotHistoryEditor_help::page_done \
             -label_font $L(font_button) -style she_btn
     }

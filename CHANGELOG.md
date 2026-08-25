@@ -1,5 +1,272 @@
 # Changelog
 
+## v0.7.1 - a restored file's modification time is stamped
+
+**Safety: the write capability is UNCHANGED — one `file mtime` stamp on a
+file this plugin has just legitimately moved back into place. No content is
+touched. This is the exact mechanism the edit path has used since v0.6.0.**
+
+`file rename` preserves the original's mtime, and SDB's populate only
+re-reads a shot file whose mtime is NEWER than the one it stored. Normally
+harmless — but if the shot's path was rewritten while it sat in trash, SDB
+holds the REWRITE's metadata, and the restored original, being older on the
+clock, would never be re-read. Seen for real on 2026-08-24: the core's
+flush-save bug parked a corpse under a trashed shot's filename; after the
+restore, Grind Advisor kept computing from the corpse's row ("yield (no
+actual)") although the restored file plainly held `drink_weight 22.2`. That
+session was fixed by hand-stamping over adb; this version makes
+`restore_batch` stamp each successfully restored file itself, right before
+`_notify_downstream` triggers the resync that reads it.
+
+`tools/check_refresh.tcl` section H proves it: a shot whose file is a day
+old on the clock is deleted and restored, and the restored file's mtime
+must postdate the restore — with the old `file rename`-only code it keeps
+the day-old stamp and SDB would skip it.
+
+## v0.7.0 - the Lumen home page is told about edits and deletes too
+
+**Safety: the write capability is UNCHANGED, and nothing was added to it.
+This version widens the v0.6.3 notification — it adds a second guarded,
+read-only downstream call, no new write of any kind.**
+
+Owner goal: edit or delete a shot here, return to the Lumen home screen, and
+see everything updated — the Grind Advisor card, the chart, and the LAST
+SHOT card. v0.6.3 wired Grind Advisor; the skin's chart and card kept
+showing the old (or deleted) shot, because the skin only read the newest
+shot file at startup.
+
+* **`_notify_downstream`** wraps the existing `_refresh_grind_advisor` and
+  then calls **`::lumen::refresh_after_history_change`** (new in Lumen
+  0.28.0), in that order on purpose: Grind Advisor's step resyncs SDB, and
+  Lumen's bag cycler reads SDB. All four call sites (edit, delete, partial
+  delete, restore) switched from the bare Grind Advisor call to this.
+* Same guards, same contract as v0.6.3: `info procs` existence check (a
+  different skin simply skips the step), errors logged and swallowed —
+  this plugin's own save/delete has already succeeded by then, and Grind
+  Advisor's summary note survives a Lumen failure.
+* **`tools/check_refresh.tcl` section G** proves it with a counter stub:
+  a delete reaches Lumen exactly once (and Grind Advisor still exactly
+  once), an edit reaches it, nothing-moved does not, and both the
+  absent-Lumen and throwing-Lumen cases leave the delete successful with
+  the Grind Advisor note intact. Sections A–E pass unchanged, which is the
+  regression proof: with no `::lumen` namespace the wrapper degrades to
+  exactly the v0.6.3 behaviour.
+
+## v0.6.4 - the startup line said "vv0.6.3" (log text only)
+
+**Safety: nothing changed. One string literal and one comment. No code path,
+no write, no page.**
+
+Seen in the tablet log after the v0.6.3 restart:
+
+```
+INFO: ShotHistoryEditor: started card browser vv0.6.3 (edit save + soft delete active)
+```
+
+`plugin.tcl`'s message prepends a literal `v`, and the `version` variable's
+VALUE carried one too. Fixed on the variable, not the message: this plugin was
+the only one of the 24 on the tablet storing a prefixed version — every other
+one stores a bare number. The core reads that variable solely to decide
+whether a plugin's metadata loaded (`plugins.tcl:204`) and never displays it,
+so nothing outside this plugin depended on either format.
+
+`tools/check_refresh.tcl` section F now rebuilds the startup line from
+`plugin.tcl`'s own literal and fails on a doubled prefix.
+
+## v0.6.3 - a deleted shot now stops counting towards the grind recommendation
+
+**Safety: the write capability is UNCHANGED, and nothing was added to it.
+Soft delete still means moving `history/<shot>.shot` and its matching
+`history_v2/<shot>.json` into this plugin's own `trash/` folder, restorable,
+with a manifest and an audit log. The edit path still writes exactly one
+targeted line inside a `.shot` file's settings block. No SQL is issued by this
+plugin, nothing is permanently deleted, and this version adds no new write of
+any kind — it adds a NOTIFICATION to another plugin.**
+
+Owner-reported from the tablet: deleting a shot did not change the grind
+recommendation, *"just like last time when I edited"*.
+
+Last time was v0.6.0, which found that every edit this plugin had ever made
+was invisible to SDB and fixed it — the file's mtime is stamped, and Grind
+Advisor is told the edit happened. That call went into the edit path and
+**nowhere else**. `perform_delete_batch` moved the files, wrote its manifest
+and log, and returned without telling anyone. `restore_batch` had the same
+gap in reverse.
+
+Everything downstream was already correct, which is what makes this small:
+
+* SDB's own `populate` flags a vanished file `removed=1` by **absence alone**
+  (`SDB.tcl`, "Check files deleted from disk"). Deleting needs no mtime trick,
+  unlike editing.
+* Grind Advisor already filters that column in its SQL, and again defensively
+  in Tcl.
+
+So the deleted shots kept feeding the regression purely because nobody asked
+for the resync. The notification was the only missing link.
+
+### What changed
+
+* **`_refresh_grind_advisor`** — the guarded call to
+  `::plugins::GrindAdvisor::refresh_from_history`, lifted out of
+  `perform_metadata_edit` into one shared proc. Same guards as before: absent
+  plugin and thrown error both leave this plugin's own result a success,
+  because its work is finished by the time this runs.
+* **`perform_delete_batch`** calls it once per **batch**, after the manifest is
+  written, and only when files actually moved — the resync rescans the whole
+  history folder, so it is not something to do per file or on a batch that
+  moved nothing. The partial-failure path refreshes too: files that already
+  moved have changed the history folder whether or not the batch finished.
+* **`restore_batch`** calls it when something actually came back. A restore
+  blocked entirely by name collisions changes nothing and asks for nothing.
+* **The Delete Result page reports it**, the way the Edit Result page already
+  did — "Grind Advisor: SDB resynced, recomputed: 7.5". Before this the
+  deleted shots kept counting and nothing on screen said so.
+* **`tools/check_refresh.tcl`** drives the real `perform_delete_batch` and
+  `restore_batch` against a temporary history folder with
+  `refresh_from_history` replaced by a counter, asserting all of it: one
+  refresh per batch regardless of size, none when nothing moved, none on a
+  collision-blocked restore, and the plugin still reporting its own success
+  when Grind Advisor is missing or throws. Negative-tested against the v0.6.2
+  wiring, where it fails on exactly the delete and restore cases while the
+  edit case still passes — the owner's report, reproduced.
+
+**One proc, three paths, on purpose.** Two copies of this logic is how the
+delete path came to be missed in the first place.
+
+## v0.6.2 - every page's way out is the bottom-left corner (display only)
+
+**Safety: no write behavior changed. Button x coordinates only.**
+
+v0.6.1 moved Edit Preview's Done; the owner asked for the rest. Every page's
+exit control now sits at the far left, aligned with the card list's own Done
+(`bar_left`), so leaving a flow is the same corner every time however deep it
+went:
+
+| page | now leads with |
+|---|---|
+| Detail | Done, then Back / Prev / Next, then Edit Metadata Preview |
+| Diagnostics, Help | Done, then Back / Prev / Next |
+| Trash | Done, then Back / ◀ Prev |
+| Recent | Done, then Back |
+| Edit Result, Delete Result | Done |
+| Edit Confirm | Cancel (Save Change stays right) |
+| Delete Review, Delete Confirm | Cancel (Continue / Delete stay right) |
+
+**The confirm pages move Cancel, not the forward button.** Cancel is the way
+out — the role Done plays elsewhere — and the destructive button must not be
+where a thumb is repeatedly tapping to leave. Delete Review and Delete Confirm
+were not in the owner's list, but leaving them behind while their edit-flow
+twin moved would have been a worse answer than the one asked for.
+
+Every button keeps its width, including Detail's wide **Edit Metadata
+Preview**: the row gains on the right exactly what it lost on the left, so
+that button is 696px before and after.
+
+### tools/check_bars.tcl
+
+New. It sources the real plugin with the framework stubbed, runs all 13
+pages' `setup{}`, and prints every bottom bar left to right, asserting the row
+starts at the left margin, no two buttons overlap, and nothing runs past the
+right margin. This kind of change is easy to half-do — one page missed, or a
+row left starting at the old x with a button dropped on top of it — and eight
+bars cannot be checked by eye. It caught exactly that: the first cut put Done
+at the left of Diagnostics and Help *on top of* Back, which still had `set x
+$lx`.
+
+## v0.6.1 - Edit Preview's Done moves to the far left (display only)
+
+**Safety: no write behavior changed. This is one button's x coordinate.**
+
+Owner request: *"in the shot history editor, edit preview page, move the done
+button to the far left, it makes it easier this way when i click done and
+click done again the same place."*
+
+Leaving the editor is two taps: Done on Edit Preview, then Done on the card
+list it returns to. The card list's Done is `bar_left` — the far left, per the
+design system's "Done left / Advanced right" — while Edit Preview's was at the
+far right, so the two taps were in opposite corners of the screen. They are
+the same spot now.
+
+**Back stays beside Done** rather than moving to the far right, because on
+this page the two run the identical command (`page_done` reuses
+`back_from_edit_preview`). Splitting them across the bar would advertise a
+difference that does not exist.
+
+Geometry checked against the plugin's own `_init_layout`: Done `92..492`,
+Back `512..912`, page edge `2468` — no overlap, no overflow, and Done's left
+edge is exactly the card list's `left_x`, which is what makes the two taps
+land together.
+
+The other dialog pages (Edit Confirm, Edit Result, Delete Result, Detail,
+Trash, Diagnostics, Help) still carry Done at the far right. Same
+double-tap mismatch applies to their exits; left alone as out of scope for
+this request.
+
+## v0.6.0 - an edited shot now LOOKS edited (and Grind Advisor follows it)
+
+**Safety: the write capability is unchanged. This plugin still writes exactly
+one thing — the single targeted line inside `history/<shot>.shot`'s settings
+block — plus its own backups, manifest and log. `history_v2` is untouched, no
+SQL is issued, and nothing is deleted. Two things were added on top of that
+same save: the file's modification TIME is stamped, and Grind Advisor is told
+the edit happened.**
+
+### The bug: every edit this plugin has ever made was invisible to SDB
+
+Owner-reported: correcting a shot's grind changed nothing downstream, even
+after Grind Advisor v3.9.0 added an explicit resync-and-recalculate button.
+That button reported `SDB resynced, recomputed: 5.6` and produced the same
+number as before.
+
+Measured on the tablet, 2026-08-19:
+
+| | value |
+|---|---|
+| `edit_log.txt` | `20260818T164530 EDIT OK filename=20260818T164430 field=grinder_setting old=7.5 new=8` |
+| the file's content | `grinder_setting 8` — the edit is really there |
+| the file's mtime | **1787057093** = 16:44:53, when the app first wrote the shot |
+| SDB's row | `grinder_setting '7.5'`, `file_modification_date` **1787057093** |
+
+The edit was made at 16:45:30 and the file's timestamp still said 16:44:53.
+`file rename` landed the replacement carrying the **original's** timestamp:
+Tcl's rename falls back to a copy on this storage, and Tcl's copy preserves
+file times.
+
+SDB re-reads a `.shot` only when `file mtime > file_modification_date`
+(`SDB.tcl:2060`). Those two numbers were byte-identical, so it skipped the
+file — and would have skipped it forever. **SDB's own "Resync database to
+history" button could never have picked up an edit made by this plugin
+either.** Every edit in `edit_log.txt`, going back to July, is in the same
+position.
+
+### The fix
+
+One `file mtime $path [clock seconds]` on the file this plugin has just
+legitimately rewritten. No content is touched. It runs **after** the
+post-rename verification, so a save that failed and was rolled back never
+stamps anything, and it is wrapped in `catch` — a stamp that fails logs a
+NOTICE and does not fail the save, which has already succeeded by then.
+
+### Grind Advisor is now told automatically
+
+Answering the owner's *"why not auto recalculate?"*: on a successful save this
+plugin calls `::plugins::GrindAdvisor::refresh_from_history` when that plugin
+is installed — guarded on both existence and errors, because this plugin's own
+save has already succeeded and must report success whatever another plugin
+does. The result line is shown on the save-result page (`Grind Advisor: SDB
+resynced, recomputed: 6.0`).
+
+An edit is exactly the right moment to spend a full history rescan: it happens
+once, when you asked for it. A display tick is not — which is why Grind
+Advisor does not do this on every recommendation lookup.
+
+### Existing edits
+
+Files edited before this version still carry their original timestamps, so
+SDB still cannot see them. Re-saving the field in this plugin fixes each one:
+there is no no-op guard, so saving the same value again is a real write and
+stamps the time.
+
 ## v0.5.4 - Pass 5.4 Theme/Contrast Bugfix (display only)
 
 Fixes the "inverted colors" report: under the Lumen skin the pages showed a

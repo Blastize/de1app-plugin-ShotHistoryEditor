@@ -1,7 +1,27 @@
 # Shot History Editor
 
-Version: v0.5.4
+Version: v0.7.1
 Author: Blastize
+
+## Downstream effect of an edit, a delete or a restore (v0.6.0 / v0.6.3 / v0.7.0)
+
+A change made here is invisible downstream until someone is told: Grind
+Advisor reads SDB, and the Lumen skin reads the newest shot file only at
+startup. So whenever this plugin changes what is on disk — a metadata save
+(v0.6.0), a delete or restore batch (v0.6.3) — it notifies both, in order
+(v0.7.0):
+
+1. **Grind Advisor** — `refresh_from_history` resyncs SDB, drops its per-bag
+   cache, recomputes for the loaded bag and re-saves; the result page
+   reports what it did.
+2. **Lumen** — `refresh_after_history_change` reloads the home page's chart
+   and LAST SHOT card from the (possibly new) newest shot file, and rebuilds
+   the bag cycler from the freshly-resynced SDB.
+
+It runs **once per batch**, and only when files actually moved, because the
+resync rescans the whole history folder. Either target may be missing (a
+different skin, no Grind Advisor) or may fail — this plugin's own save or
+delete still succeeds; its work is already done by then.
 
 ## Pass 5.4 Scope -- Theme/Contrast Bugfix (display only)
 
@@ -61,6 +81,33 @@ This pass authorizes exactly one new capability: writing ONE targeted `settings{
 - **`history_v2/<filename>.json` decision:** NOT written by this pass. Same evidence as the delete pass (nothing in this workspace reads or depends on it), plus its `meta.bean`/`meta.grinder` key names differ from the `.shot` settings block, so keeping them in sync would need a second write path with no proven need. A saved field can leave history_v2 showing a stale value until a future pass addresses it.
 - **SDB staleness:** SDB is never written to, so the card list and Detail page overlay saved edits from a new `edit_manifest.txt`, reusing the exact pattern already proven for the delete pass's trash-manifest filter.
 - **Bug found and fixed in existing code:** while testing against the real sample files, `read_legacy_settings`/`_parse_settings_file`'s `$trimmed eq "settings {"` and `$trimmed eq "}"` comparisons turned out to only survive Tcl's source-time brace-matching by an accidental cancellation between the two, and threw a runtime "invalid character '}' in expression" error the first time either was actually exercised against a genuine multi-line `.shot` file -- never triggered before because this plugin's own prior tests only used single-line synthetic fixtures. Fixed by escaping both literal braces (`\{`/`\}`); behavior is unchanged, this only fixes a latent crash in the existing read path that every previous version's Detail/Diagnostics display would have hit against a real file.
+
+### v0.6.0 — an edited shot now looks edited
+
+Until v0.6.0 an edit made here was invisible to **SDB**, and therefore to
+everything downstream of it. Not because SDB was stale in the "will catch up
+later" sense — because it could never catch up at all.
+
+`file rename` landed the rewritten file carrying the **original's**
+modification time (Tcl's rename falls back to a copy on this storage, and
+Tcl's copy preserves file times). SDB only re-reads a `.shot` when
+`file mtime > file_modification_date`, and those two values were byte-identical
+— measured on the tablet: an edit made at 16:45:30 left the file claiming
+16:44:53, exactly what SDB had stored. So SDB skipped it, and **SDB's own
+"Resync database to history" button could not have helped either.**
+
+v0.6.0 stamps the file's modification time after a verified save. Content is
+untouched; this is the same file the save has just legitimately rewritten.
+
+It also calls `::plugins::GrindAdvisor::refresh_from_history` when that plugin
+is installed, so the recommendation follows a correction without anyone having
+to know that it should. The save-result page reports what it did. Both are
+guarded: the save has already succeeded by that point and reports success
+regardless.
+
+**Edits made before v0.6.0** still carry their original timestamps. Re-saving
+the field fixes each one — there is no no-op guard, so saving the same value
+again is a real write and stamps the time.
 
 ### Save flow
 
