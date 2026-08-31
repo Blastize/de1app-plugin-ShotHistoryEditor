@@ -1,7 +1,15 @@
 # Shot History Editor
 
-Version: v0.7.1
+Version: v0.8.0
 Author: Blastize
+
+## Dark mode (v0.8.0)
+
+A sun/moon button in the main page's top-left corner switches all pages
+between a light and a dark palette instantly; the choice persists across
+restarts (the plugin's first persisted setting, in its own settings.tdb).
+State reds/ambers lighten on dark for contrast. No change to any write
+capability.
 
 ## Downstream effect of an edit, a delete or a restore (v0.6.0 / v0.6.3 / v0.7.0)
 

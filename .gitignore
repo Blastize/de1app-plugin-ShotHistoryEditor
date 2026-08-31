@@ -24,6 +24,12 @@ edit_log.txt
 # Version archives
 *Archive/
 
+# Internal working notes -- kept local, never published.
+PROJECT_STATE.md
+
+# Local dev tooling -- contains absolute paths from this machine.
+tools/
+
 # OS junk
 desktop.ini
 Thumbs.db

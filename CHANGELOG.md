@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.8.0 - dark mode
+
+**Safety: no change to the write capability.** The one new persisted
+value is `theme` in the plugin's own settings.tdb (its first persisted
+setting), saved on each explicit toggle tap. History files, SDB and the
+trash mechanism are untouched.
+
+- A sun/moon button on the main page (top-LEFT corner — the top-right
+  slot belongs to the Select mode button here) switches all 13 pages
+  between a light and a dark palette instantly; the choice persists
+  across restarts.
+- Every color the plugin paints moved from scattered literals into one
+  `_apply_palette` proc (the offline harness enforces that no palette
+  literal appears anywhere else). All of this plugin's colors are
+  creation-time, so `_retheme_all`'s bare-tag walk is the complete
+  repaint: page backgrounds, all text roles, the card rows, the trash
+  and inspector row lists, both entries (with their attached labels),
+  every button face, and the three danger-labeled buttons (Confirm
+  Delete / Save Change), whose red lightens on dark for contrast — as
+  do the warn amber and the value blue.
+- Two previously untagged labels on the Edit Preview page (Field
+  selector / Current value) gained tags so the repaint can reach them.
+- Offline harness: scratchpad verify_she_v080.tcl, 79 checks.
+
 ## v0.7.1 - a restored file's modification time is stamped
 
 **Safety: the write capability is UNCHANGED — one `file mtime` stamp on a

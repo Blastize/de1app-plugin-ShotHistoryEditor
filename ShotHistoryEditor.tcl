@@ -154,6 +154,203 @@ proc ::plugins::ShotHistoryEditor::msg {args} {
 # fixed virtual base resolution) and `font_scale` (fonts, from the real
 # detected physical screen, same winfo pattern as before).
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+#  Theme palette (v0.8.0). Every color the plugin paints comes from these
+#  tokens, chosen per settings(theme) (light | dark, default light, persisted
+#  in the plugin's own settings.tdb -- this plugin's first persisted setting).
+#  Called from _init_layout at startup and from toggle_theme at runtime.
+# ---------------------------------------------------------------------------
+
+proc ::plugins::ShotHistoryEditor::_apply_palette {} {
+    variable L
+    variable settings
+    set dark 0
+    catch { if {$settings(theme) eq "dark"} { set dark 1 } }
+    if {$dark} {
+        set L(page_bg)      "#23252e"
+        set L(card_bg)      "#32353f"
+        set L(card_outline) "#464b58"
+        set L(text_hi)      "#e8e9ee"
+        set L(text_body)    "#c2c5cf"
+        set L(text_mut)     "#8d92a0"
+        set L(danger)       "#ff8a80"
+        set L(warn)         "#e0a860"
+        set L(value_blue)   "#8ab4ff"
+        set L(entry_bg)     "#3a3e4a"
+        set L(entry_danger_bg) "#4a3438"
+        set L(btn_fill)     "#4a5473"
+        set L(btn_disabled_fill) "#3a3e4a"
+    } else {
+        set L(page_bg)      "#d5d6e3"   ;# stock settings-page grey
+        set L(card_bg)      "#fbfbfd"
+        set L(card_outline) "#dcdcdc"
+        set L(text_hi)      "#2b2b2b"
+        set L(text_body)    "#444444"
+        set L(text_mut)     "#666666"
+        set L(danger)       "#c0392b"
+        set L(warn)         "#7a4b00"
+        set L(value_blue)   "#4e85f4"
+        set L(entry_bg)     "#fbfaff"
+        set L(entry_danger_bg) "#fff5f5"
+        set L(btn_fill)     "#c0c5e3"   ;# stock dbutton periwinkle
+        set L(btn_disabled_fill) "#dddddd"
+    }
+}
+
+proc ::plugins::ShotHistoryEditor::_glyph_for {name} {
+    set glyph ""
+    catch {
+        if {[dui symbol exists $name]} { set glyph [dui symbol get $name] }
+    }
+    return $glyph
+}
+
+# Moon in light mode (tap for dark), sun-bright in dark; text fallback.
+proc ::plugins::ShotHistoryEditor::_theme_button_face {} {
+    variable L
+    variable settings
+    set dark 0
+    catch { if {$settings(theme) eq "dark"} { set dark 1 } }
+    if {[info exists L(have_icons)] && $L(have_icons)} {
+        set g [_glyph_for [expr {$dark ? "sun-bright" : "moon"}]]
+        if {$g ne ""} { return $g }
+    }
+    return [expr {$dark ? [translate "Light"] : [translate "Dark"]}]
+}
+
+proc ::plugins::ShotHistoryEditor::toggle_theme {} {
+    variable settings
+    set settings(theme) [expr {$settings(theme) eq "dark" ? "light" : "dark"}]
+    catch { plugins save_settings ShotHistoryEditor }
+    _apply_palette
+    _retheme_all
+    catch { dui item config ShotHistoryEditor_settings btn_theme -label [_theme_button_face] }
+    catch { msg "ShotHistoryEditor: theme switched to $settings(theme)" }
+}
+
+# Repaint every palette-colored item by bare tag on all 13 pages. All
+# colors in this plugin are creation-time (no refresh reconfigures a
+# fill), so this walk IS the complete repaint. Buttons restyle through
+# their -btn shape tags (labels stay white in both themes, except the
+# three danger-labeled buttons, whose -lbl follows L(danger)).
+proc ::plugins::ShotHistoryEditor::_retheme_all {} {
+    variable L
+    foreach p {ShotHistoryEditor_settings ShotHistoryEditor_advanced
+               ShotHistoryEditor_delete_review ShotHistoryEditor_delete_confirm
+               ShotHistoryEditor_delete_result ShotHistoryEditor_trash
+               ShotHistoryEditor_recent ShotHistoryEditor_detail
+               ShotHistoryEditor_edit_preview ShotHistoryEditor_edit_confirm
+               ShotHistoryEditor_edit_result ShotHistoryEditor_diagnostics
+               ShotHistoryEditor_help} {
+        catch { dui item config $p page_bg -fill $L(page_bg) -outline $L(page_bg) }
+    }
+    # Text roles: {page tag role} triplets.
+    foreach {p tag role} {
+        ShotHistoryEditor_settings page_title text_hi
+        ShotHistoryEditor_settings subtitle text_mut
+        ShotHistoryEditor_settings recent_status text_mut
+        ShotHistoryEditor_advanced page_title text_body
+        ShotHistoryEditor_advanced subtitle text_mut
+        ShotHistoryEditor_advanced deleted_note warn
+        ShotHistoryEditor_delete_review page_title danger
+        ShotHistoryEditor_delete_review review_count_text text_body
+        ShotHistoryEditor_delete_review review_intro text_mut
+        ShotHistoryEditor_delete_review review_page_status text_mut
+        ShotHistoryEditor_delete_review review_text text_body
+        ShotHistoryEditor_delete_confirm page_title danger
+        ShotHistoryEditor_delete_confirm confirm_instructions text_body
+        ShotHistoryEditor_delete_confirm confirm_error_text danger
+        ShotHistoryEditor_delete_result page_title text_body
+        ShotHistoryEditor_delete_result result_text text_body
+        ShotHistoryEditor_edit_confirm page_title danger
+        ShotHistoryEditor_edit_confirm confirm_shot_text text_body
+        ShotHistoryEditor_edit_confirm confirm_file_text text_mut
+        ShotHistoryEditor_edit_confirm confirm_field_text text_body
+        ShotHistoryEditor_edit_confirm confirm_before_text text_body
+        ShotHistoryEditor_edit_confirm confirm_after_text danger
+        ShotHistoryEditor_edit_confirm confirm_warning_text warn
+        ShotHistoryEditor_edit_result page_title text_body
+        ShotHistoryEditor_edit_result edit_result_text text_body
+        ShotHistoryEditor_trash page_title text_body
+        ShotHistoryEditor_trash trash_status text_mut
+        ShotHistoryEditor_trash header text_body
+        ShotHistoryEditor_recent page_title text_body
+        ShotHistoryEditor_recent recent_status text_mut
+        ShotHistoryEditor_recent header text_body
+        ShotHistoryEditor_detail page_title text_body
+        ShotHistoryEditor_detail detail_page_status text_mut
+        ShotHistoryEditor_detail detail_text text_body
+        ShotHistoryEditor_edit_preview page_title text_body
+        ShotHistoryEditor_edit_preview selected_shot text_body
+        ShotHistoryEditor_edit_preview editable_source text_mut
+        ShotHistoryEditor_edit_preview fs_label text_body
+        ShotHistoryEditor_edit_preview field_value value_blue
+        ShotHistoryEditor_edit_preview cv_label text_body
+        ShotHistoryEditor_edit_preview current_value text_body
+        ShotHistoryEditor_edit_preview preview_status warn
+        ShotHistoryEditor_edit_preview preview_text text_body
+        ShotHistoryEditor_diagnostics page_title text_body
+        ShotHistoryEditor_diagnostics diagnostics_page_status text_mut
+        ShotHistoryEditor_diagnostics diagnostics_text text_body
+        ShotHistoryEditor_help page_title text_body
+        ShotHistoryEditor_help help_page_status text_mut
+        ShotHistoryEditor_help help_text text_body
+    } {
+        catch { dui item config $p $tag -fill $L($role) }
+    }
+    # Card rows on the main page.
+    for {set i 0} {$i < 12} {incr i} {
+        catch { dui item config ShotHistoryEditor_settings row${i}_bg \
+            -fill $L(card_bg) -outline $L(card_outline) }
+        catch { dui item config ShotHistoryEditor_settings row${i}_line1 -fill $L(text_hi) }
+        catch { dui item config ShotHistoryEditor_settings row${i}_line2 -fill $L(text_body) }
+        catch { dui item config ShotHistoryEditor_settings row${i}_line3 -fill $L(text_mut) }
+        catch { dui item config ShotHistoryEditor_trash row${i}_text -fill $L(text_body) }
+        catch { dui item config ShotHistoryEditor_recent row${i}_text -fill $L(text_body) }
+    }
+    # Entries (Tk widgets; their attached labels are -lbl sub-items).
+    catch { dui item config ShotHistoryEditor_delete_confirm confirm_entry \
+        -bg $L(entry_danger_bg) -foreground $L(danger) }
+    catch { dui item config ShotHistoryEditor_delete_confirm confirm_entry-lbl -fill $L(text_body) }
+    catch { dui item config ShotHistoryEditor_edit_preview new_value \
+        -bg $L(entry_bg) -foreground $L(value_blue) }
+    catch { dui item config ShotHistoryEditor_edit_preview new_value-lbl -fill $L(text_body) }
+    # Buttons: shape fills (labels stay white; three danger labels follow).
+    foreach {p tags} {
+        ShotHistoryEditor_settings {mode_btn prev_page next_page bar_left bar_right btn_theme
+                                    row0_btn row1_btn row2_btn row3_btn row4_btn}
+        ShotHistoryEditor_advanced {source_inspector diagnostics help_guide trash_restore back}
+        ShotHistoryEditor_delete_review {cancel continue_btn}
+        ShotHistoryEditor_delete_confirm {cancel confirm_delete}
+        ShotHistoryEditor_delete_result {page_done}
+        ShotHistoryEditor_edit_confirm {cancel save_change}
+        ShotHistoryEditor_edit_result {page_done}
+        ShotHistoryEditor_trash {page_done back trash_prev_page
+                                 row0_restore row1_restore row2_restore row3_restore
+                                 row4_restore row5_restore row6_restore row7_restore}
+        ShotHistoryEditor_recent {page_done back
+                                  row0_open row1_open row2_open row3_open
+                                  row4_open row5_open row6_open row7_open}
+        ShotHistoryEditor_detail {page_done back prev_page next_page edit_preview}
+        ShotHistoryEditor_edit_preview {next_field preview_change save_change page_done back}
+        ShotHistoryEditor_diagnostics {back prev_page next_page page_done}
+        ShotHistoryEditor_help {back prev_page next_page page_done}
+    } {
+        foreach t $tags {
+            catch { dui item config $p ${t}-btn \
+                -fill $L(btn_fill) -outline $L(btn_fill) \
+                -disabledfill $L(btn_disabled_fill) -disabledoutline $L(btn_disabled_fill) }
+        }
+    }
+    foreach {p t} {
+        ShotHistoryEditor_delete_confirm confirm_delete
+        ShotHistoryEditor_edit_confirm save_change
+        ShotHistoryEditor_edit_preview save_change
+    } {
+        catch { dui item config $p ${t}-lbl -fill $L(danger) }
+    }
+}
+
 proc ::plugins::ShotHistoryEditor::_init_layout {} {
     variable L
     array unset L
@@ -214,9 +411,9 @@ proc ::plugins::ShotHistoryEditor::_init_layout {} {
     # paints its own page background and its button style carries explicit
     # fills, so nothing depends on which dui theme or skin palette happens
     # to be current when this plugin loads or renders.
-    set L(page_bg) "#d5d6e3"           ;# stock settings-page grey
-    set L(btn_fill) "#c0c5e3"          ;# stock dbutton periwinkle
-    set L(btn_disabled_fill) "#dddddd"
+    # v0.8.0: every color token lives in _apply_palette (light / dark, per
+    # settings(theme)) so the sun/moon toggle can swap it at runtime.
+    _apply_palette
     set L(btn_label_fill) white
 
     set L(header_y1) [expr {int(round(96 * $scale))}]
@@ -269,6 +466,24 @@ proc ::plugins::ShotHistoryEditor::_init_layout {} {
                 font create $fname -family Helvetica -size [expr {-$px}] -weight $weight
             }
             set L(font_$name) $fname
+        }
+    }
+
+    # v0.8.0: icon font for the theme toggle's sun/moon face (the app's
+    # own FA6 Pro file, dui's loader; text fallback when unavailable).
+    set L(have_icons) 0
+    set L(font_icon) $L(font_button)
+    catch {
+        set fam [dui::font::add_or_get_familyname "Font Awesome 6 Pro-Regular-400.otf"]
+        if {$fam ne ""} {
+            set px [expr {int(max(16, round(26 * $font_scale)))}]
+            if {[lsearch -exact [font names] SHE_icon] >= 0} {
+                font configure SHE_icon -family $fam -size [expr {-$px}]
+            } else {
+                font create SHE_icon -family $fam -size [expr {-$px}]
+            }
+            set L(font_icon) SHE_icon
+            set L(have_icons) 1
         }
     }
 
@@ -335,6 +550,12 @@ proc ::plugins::ShotHistoryEditor::preload_pages {} {
     package require de1_dui 1.0
     catch { package require sqlite3 }
     catch { package require json }
+    # v0.8.0: the theme choice is this plugin's first persisted setting.
+    catch { plugins load_settings ShotHistoryEditor }
+    variable settings
+    if {![info exists settings(theme)] || $settings(theme) ni {light dark}} {
+        set settings(theme) light
+    }
     _init_layout
 
     dui page add ShotHistoryEditor_settings -namespace true -theme default -type fpdialog
@@ -2714,9 +2935,9 @@ namespace eval ::dui::pages::ShotHistoryEditor_settings {
         set cx [expr {($lx + $rx) / 2}]
 
         dui add dtext $page $cx $L(header_title_y) -tags page_title -text [translate "Shot History Editor"] \
-            -font $L(font_title) -width $L(content_w) -fill "#2b2b2b" -anchor center -justify center
+            -font $L(font_title) -width $L(content_w) -fill $L(text_hi) -anchor center -justify center
         dui add dtext $page $cx $L(header_subtitle_y) -tags subtitle -text [translate "Edits and Delete both require confirmation. Delete moves files to trash, never permanent."] \
-            -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor center -justify center
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor center -justify center
 
         # Mode button, top-right (single button; see fix note above).
         set mode_btn_y1 [expr {int(($L(header_y1)-$L(btn_h))/2)}]
@@ -2724,10 +2945,19 @@ namespace eval ::dui::pages::ShotHistoryEditor_settings {
             -tags mode_btn -label [translate "Select"] -command ::plugins::ShotHistoryEditor::toggle_select_mode \
             -label_font $L(font_button) -style she_btn
 
+        # v0.8.0: theme toggle. The top-right header slot is taken by the
+        # mode button on this page, so the toggle mirrors it in the
+        # top-LEFT corner (square, sun/moon face).
+        dui add dbutton $page $lx $mode_btn_y1 [expr {$lx+$L(btn_h)}] [expr {$mode_btn_y1+$L(btn_h)}] \
+            -tags btn_theme -label [::plugins::ShotHistoryEditor::_theme_button_face] \
+            -command ::plugins::ShotHistoryEditor::toggle_theme \
+            -label_font [expr {$L(have_icons) ? $L(font_icon) : $L(font_button)}] \
+            -style she_btn
+
         # Toolbar: status left, Prev/Next right (moved up from the bottom per spec).
         dui add dtext $page $lx $L(toolbar_y0) -tags recent_status -text "" \
             -font $L(font_caption) -width [expr {$L(content_w)-2*($L(btn_w_std)+$L(sm))}] \
-            -fill "#666666" -anchor nw -justify left
+            -fill $L(text_mut) -anchor nw -justify left
         set next_x1 [expr {$rx - $L(btn_w_std)}]
         set prev_x1 [expr {$next_x1 - $L(sm) - $L(btn_w_std)}]
         dui add dbutton $page $prev_x1 $L(toolbar_y0) [expr {$prev_x1+$L(btn_w_std)}] $L(toolbar_y1) \
@@ -2748,14 +2978,14 @@ namespace eval ::dui::pages::ShotHistoryEditor_settings {
             set bottom [expr {$top + $L(card_h)}]
 
             ::plugins::ShotHistoryEditor::rounded_rect $page $lx $top $rx $bottom $L(card_radius) \
-                -fill "#fbfbfd" -outline "#dcdcdc" -width 2 -tags row${i}_bg
+                -fill $L(card_bg) -outline $L(card_outline) -width 2 -tags row${i}_bg
 
             dui add dtext $page $text_x [expr {$top+$L(card_line1_dy)}] -tags row${i}_line1 -text "" \
-                -font $L(font_primary) -width $text_w -fill "#2b2b2b" -anchor w -justify left
+                -font $L(font_primary) -width $text_w -fill $L(text_hi) -anchor w -justify left
             dui add dtext $page $text_x [expr {$top+$L(card_line2_dy)}] -tags row${i}_line2 -text "" \
-                -font $L(font_body) -width $text_w -fill "#444444" -anchor w -justify left
+                -font $L(font_body) -width $text_w -fill $L(text_body) -anchor w -justify left
             dui add dtext $page $text_x [expr {$top+$L(card_line3_dy)}] -tags row${i}_line3 -text "" \
-                -font $L(font_caption) -width $text_w -fill "#777777" -anchor w -justify left
+                -font $L(font_caption) -width $text_w -fill $L(text_mut) -anchor w -justify left
 
             set btn_y1 [expr {$top + int(($L(card_h)-$L(card_btn_h))/2)}]
             set btn_y2 [expr {$btn_y1 + $L(card_btn_h)}]
@@ -2796,12 +3026,12 @@ namespace eval ::dui::pages::ShotHistoryEditor_advanced {
         set lx $L(left_x); set rx $L(right_x); set cx [expr {($lx+$rx)/2}]
 
         dui add dtext $page $cx $L(header_title_y) -tags page_title -text [translate "Advanced / Source Inspector"] \
-            -font $L(font_section) -width $L(content_w) -fill "#444444" -anchor center -justify center
+            -font $L(font_section) -width $L(content_w) -fill $L(text_body) -anchor center -justify center
         dui add dtext $page $cx $L(header_subtitle_y) -tags subtitle \
             -text [translate "Optional read-only tools. Not required for normal use."] \
-            -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor center -justify center
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor center -justify center
         dui add dtext $page $lx $L(toolbar_y0) -tags deleted_note -text "" \
-            -font $L(font_caption) -width $L(content_w) -fill "#7a4b00" -anchor nw -justify left
+            -font $L(font_caption) -width $L(content_w) -fill $L(warn) -anchor nw -justify left
 
         set y $L(list_top)
         dui add dbutton $page $lx $y $rx [expr {$y+$L(btn_h)}] -tags source_inspector \
@@ -2848,17 +3078,17 @@ namespace eval ::dui::pages::ShotHistoryEditor_delete_review {
         set lx $L(left_x); set rx $L(right_x); set cx [expr {($lx+$rx)/2}]
 
         dui add dtext $page $cx $L(header_solo_title_y) -tags page_title -text [translate "Delete -- Step 1: Review"] \
-            -font $L(font_section) -width $L(content_w) -fill "#c0392b" -anchor center -justify center
+            -font $L(font_section) -width $L(content_w) -fill $L(danger) -anchor center -justify center
         dui add dtext $page $lx $L(toolbar_y0) -tags review_count_text -text "" \
-            -font $L(font_body) -width $L(content_w) -fill "#444444" -anchor nw -justify left
+            -font $L(font_body) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
         dui add dtext $page $lx [expr {$L(toolbar_y0)+$L(lg)}] -tags review_intro \
             -text [translate "These shots will be moved to the plugin trash folder. Nothing is permanently deleted."] \
-            -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor nw -justify left
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor nw -justify left
 
         dui add dtext $page $lx [expr {$L(toolbar_y0)+2*$L(lg)}] -tags review_page_status -text "" \
-            -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor nw -justify left
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor nw -justify left
         dui add dtext $page $lx $L(list_top) -tags review_text -text "" \
-            -font $L(font_caption) -width $L(content_w) -fill "#444444" -anchor nw -justify left
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
 
         set right_btn_x1 [expr {$rx-$L(btn_w_std)}]
         set left_btn_x1 [expr {$right_btn_x1-$L(sm)-$L(btn_w_std)}]
@@ -2887,19 +3117,19 @@ namespace eval ::dui::pages::ShotHistoryEditor_delete_confirm {
         set lx $L(left_x); set rx $L(right_x); set cx [expr {($lx+$rx)/2}]
 
         dui add dtext $page $cx $L(header_solo_title_y) -tags page_title -text [translate "Delete -- Step 2: Confirm"] \
-            -font $L(font_section) -width $L(content_w) -fill "#c0392b" -anchor center -justify center
+            -font $L(font_section) -width $L(content_w) -fill $L(danger) -anchor center -justify center
 
         # Typed confirmation input stays in the top half of the screen (Android
         # keyboard covers the bottom).
         dui add dtext $page $lx $L(toolbar_y0) -tags confirm_instructions -text "" \
-            -font $L(font_body) -width $L(content_w) -fill "#444444" -anchor nw -justify left
+            -font $L(font_body) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
         dui add entry $page $lx [expr {$L(toolbar_y0)+3*$L(lg)}] -tags confirm_entry \
             -textvariable ::plugins::ShotHistoryEditor::confirm_input \
-            -width 20 -font $L(font_primary) -borderwidth 1 -bg #fff5f5 -foreground "#c0392b" -relief flat \
+            -width 20 -font $L(font_primary) -borderwidth 1 -bg $L(entry_danger_bg) -foreground $L(danger) -relief flat \
             -label [translate "Type the number here"] -label_pos [list $lx [expr {$L(toolbar_y0)+2*$L(lg)}]] \
-            -label_font $L(font_body) -label_width $L(label_col_w) -label_fill "#444444"
+            -label_font $L(font_body) -label_width $L(label_col_w) -label_fill $L(text_body)
         dui add dtext $page $lx [expr {$L(toolbar_y0)+5*$L(lg)}] -tags confirm_error_text -text "" \
-            -font $L(font_caption) -width $L(content_w) -fill "#c0392b" -anchor nw -justify left
+            -font $L(font_caption) -width $L(content_w) -fill $L(danger) -anchor nw -justify left
 
         set right_btn_x1 [expr {$rx-$L(btn_w_std)}]
         set left_btn_x1 [expr {$right_btn_x1-$L(sm)-$L(btn_w_std)}]
@@ -2908,7 +3138,7 @@ namespace eval ::dui::pages::ShotHistoryEditor_delete_confirm {
             -label [translate "Cancel"] -command ::plugins::ShotHistoryEditor::cancel_delete_confirm \
             -label_font $L(font_button) -style she_btn
         dui add dbutton $page $right_btn_x1 $L(bar_y0) $rx $L(bar_y1) -tags confirm_delete \
-            -label [translate "Confirm Delete"] -label_fill "#c0392b" \
+            -label [translate "Confirm Delete"] -label_fill $L(danger) \
             -command ::plugins::ShotHistoryEditor::confirm_delete_submit \
             -label_font $L(font_button) -style she_btn
     }
@@ -2926,9 +3156,9 @@ namespace eval ::dui::pages::ShotHistoryEditor_delete_result {
         set lx $L(left_x); set rx $L(right_x); set cx [expr {($lx+$rx)/2}]
 
         dui add dtext $page $cx $L(header_solo_title_y) -tags page_title -text [translate "Delete Result"] \
-            -font $L(font_section) -width $L(content_w) -fill "#444444" -anchor center -justify center
+            -font $L(font_section) -width $L(content_w) -fill $L(text_body) -anchor center -justify center
         dui add dtext $page $lx $L(list_top) -tags result_text -text "" \
-            -font $L(font_body) -width $L(content_w) -fill "#444444" -anchor nw -justify left
+            -font $L(font_body) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
 
         # v0.6.2: Done at the FAR LEFT, like every other page in this plugin
         # now and like the card list it returns to.
@@ -2950,20 +3180,20 @@ namespace eval ::dui::pages::ShotHistoryEditor_edit_confirm {
         set lx $L(left_x); set rx $L(right_x); set cx [expr {($lx+$rx)/2}]
 
         dui add dtext $page $cx $L(header_solo_title_y) -tags page_title -text [translate "Save -- Confirm Change"] \
-            -font $L(font_section) -width $L(content_w) -fill "#c0392b" -anchor center -justify center
+            -font $L(font_section) -width $L(content_w) -fill $L(danger) -anchor center -justify center
 
         dui add dtext $page $lx $L(toolbar_y0) -tags confirm_shot_text -text "" \
-            -font $L(font_body) -width $L(content_w) -fill "#444444" -anchor nw -justify left
+            -font $L(font_body) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
         dui add dtext $page $lx [expr {$L(toolbar_y0)+$L(lg)}] -tags confirm_file_text -text "" \
-            -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor nw -justify left
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor nw -justify left
         dui add dtext $page $lx [expr {$L(toolbar_y0)+2*$L(lg)}] -tags confirm_field_text -text "" \
-            -font $L(font_body) -width $L(content_w) -fill "#444444" -anchor nw -justify left
+            -font $L(font_body) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
         dui add dtext $page $lx [expr {$L(toolbar_y0)+3*$L(lg)}] -tags confirm_before_text -text "" \
-            -font $L(font_primary) -width $L(content_w) -fill "#444444" -anchor nw -justify left
+            -font $L(font_primary) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
         dui add dtext $page $lx [expr {$L(toolbar_y0)+4*$L(lg)}] -tags confirm_after_text -text "" \
-            -font $L(font_primary) -width $L(content_w) -fill "#c0392b" -anchor nw -justify left
+            -font $L(font_primary) -width $L(content_w) -fill $L(danger) -anchor nw -justify left
         dui add dtext $page $lx [expr {$L(toolbar_y0)+5*$L(lg)}] -tags confirm_warning_text -text "" \
-            -font $L(font_caption) -width $L(content_w) -fill "#7a4b00" -anchor nw -justify left
+            -font $L(font_caption) -width $L(content_w) -fill $L(warn) -anchor nw -justify left
 
         # v0.6.2: Cancel takes the far-left slot -- it is this page's way out,
         # the same role Done plays everywhere else, so backing out of the
@@ -2976,7 +3206,7 @@ namespace eval ::dui::pages::ShotHistoryEditor_edit_confirm {
             -label [translate "Cancel"] -command ::plugins::ShotHistoryEditor::cancel_edit_confirm \
             -label_font $L(font_button) -style she_btn
         dui add dbutton $page [expr {$rx-$L(btn_w_std)}] $L(bar_y0) $rx $L(bar_y1) -tags save_change \
-            -label [translate "Save Change"] -label_fill "#c0392b" \
+            -label [translate "Save Change"] -label_fill $L(danger) \
             -command ::plugins::ShotHistoryEditor::confirm_save_submit \
             -label_font $L(font_button) -style she_btn
     }
@@ -2994,9 +3224,9 @@ namespace eval ::dui::pages::ShotHistoryEditor_edit_result {
         set lx $L(left_x); set rx $L(right_x); set cx [expr {($lx+$rx)/2}]
 
         dui add dtext $page $cx $L(header_solo_title_y) -tags page_title -text [translate "Save Result"] \
-            -font $L(font_section) -width $L(content_w) -fill "#444444" -anchor center -justify center
+            -font $L(font_section) -width $L(content_w) -fill $L(text_body) -anchor center -justify center
         dui add dtext $page $lx $L(list_top) -tags edit_result_text -text "" \
-            -font $L(font_body) -width $L(content_w) -fill "#444444" -anchor nw -justify left
+            -font $L(font_body) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
 
         # v0.6.2: Done at the FAR LEFT. This is the page you land on after
         # saving, so it is the one whose Done gets tapped straight after
@@ -3021,14 +3251,14 @@ namespace eval ::dui::pages::ShotHistoryEditor_trash {
         set text_w [expr {$L(content_w)-$restore_w-$L(lg)}]
 
         dui add dtext $page $cx $L(header_solo_title_y) -tags page_title -text [translate "Trash / Restore"] \
-            -font $L(font_section) -width $L(content_w) -fill "#444444" -anchor center -justify center
+            -font $L(font_section) -width $L(content_w) -fill $L(text_body) -anchor center -justify center
         dui add dtext $page $lx $L(toolbar_y0) -tags trash_status -text "" \
-            -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor nw -justify left
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor nw -justify left
 
         set header_y [expr {$L(toolbar_y1)+$L(sm)}]
         dui add dtext $page $lx $header_y -tags header \
             -text "Deleted  |  shots, files  |  batch id" \
-            -font $L(font_caption) -width $L(content_w) -fill "#444444" -anchor nw -justify left
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
 
         set n_rows $::plugins::ShotHistoryEditor::trash_page_size
         set list_start [expr {$header_y+$L(md)}]
@@ -3037,7 +3267,7 @@ namespace eval ::dui::pages::ShotHistoryEditor_trash {
         set y $list_start
         for {set i 0} {$i < $n_rows} {incr i} {
             dui add dtext $page $lx $y -tags row${i}_text -text "" \
-                -font $L(font_caption) -width $text_w -fill "#444444" -anchor nw -justify left
+                -font $L(font_caption) -width $text_w -fill $L(text_body) -anchor nw -justify left
             dui add dbutton $page [expr {$rx-$restore_w}] [expr {$y-$L(xs)}] $rx [expr {$y-$L(xs)+$L(btn_h)*0.7}] \
                 -tags row${i}_restore -label [translate "Restore"] \
                 -command "::plugins::ShotHistoryEditor::restore_row $i" -label_font $L(font_button) -style she_btn
@@ -3085,13 +3315,13 @@ namespace eval ::dui::pages::ShotHistoryEditor_recent {
         set text_w [expr {$L(content_w)-$open_w-$L(lg)}]
 
         dui add dtext $page $cx $L(header_solo_title_y) -tags page_title -text [translate "Source Inspector"] \
-            -font $L(font_section) -width $L(content_w) -fill "#444444" -anchor center -justify center
+            -font $L(font_section) -width $L(content_w) -fill $L(text_body) -anchor center -justify center
         dui add dtext $page $lx $L(toolbar_y0) -tags recent_status -text "" \
-            -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor nw -justify left
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor nw -justify left
         set header_y [expr {$L(toolbar_y1)+$L(sm)}]
         dui add dtext $page $lx $header_y -tags header \
             -text "Date/time | Filename | Grind | Dose | Yield | Bean | Shot time" \
-            -font $L(font_caption) -width $L(content_w) -fill "#444444" -anchor nw -justify left
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
 
         # 8 rows must fit exactly between the header line and the bottom bar,
         # so row_h is derived from the actual available space (not a fixed
@@ -3104,7 +3334,7 @@ namespace eval ::dui::pages::ShotHistoryEditor_recent {
         set y $list_start
         for {set i 0} {$i < $n_rows} {incr i} {
             dui add dtext $page $lx $y -tags row${i}_text -text "" \
-                -font $L(font_caption) -width $text_w -fill "#444444" -anchor nw -justify left
+                -font $L(font_caption) -width $text_w -fill $L(text_body) -anchor nw -justify left
             dui add dbutton $page [expr {$rx-$open_w}] [expr {$y-$L(xs)}] $rx [expr {$y-$L(xs)+$L(btn_h)*0.7}] \
                 -tags row${i}_open -label [translate "Open"] \
                 -command "::plugins::ShotHistoryEditor::select_recent_row $i" -label_font $L(font_button) -style she_btn
@@ -3141,11 +3371,11 @@ namespace eval ::dui::pages::ShotHistoryEditor_detail {
         set lx $L(left_x); set rx $L(right_x); set cx [expr {($lx+$rx)/2}]
 
         dui add dtext $page $cx $L(header_solo_title_y) -tags page_title -text [translate "Shot Detail"] \
-            -font $L(font_section) -width $L(content_w) -fill "#444444" -anchor center -justify center
+            -font $L(font_section) -width $L(content_w) -fill $L(text_body) -anchor center -justify center
         dui add dtext $page $lx $L(toolbar_y0) -tags detail_page_status -text "" \
-            -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor nw -justify left
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor nw -justify left
         dui add dtext $page $lx $L(list_top) -tags detail_text -text "" \
-            -font $L(font_caption) -width $L(content_w) -fill "#444444" -anchor nw -justify left
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
 
         set bw $L(btn_w_std)
         # v0.6.2: Done leads, then Back / Prev / Next in their existing order,
@@ -3195,33 +3425,33 @@ namespace eval ::dui::pages::ShotHistoryEditor_edit_preview {
         set vx $L(value_x)
 
         dui add dtext $page $cx $L(header_solo_title_y) -tags page_title -text [translate "Edit Preview"] \
-            -font $L(font_section) -width $L(content_w) -fill "#444444" -anchor center -justify center
+            -font $L(font_section) -width $L(content_w) -fill $L(text_body) -anchor center -justify center
         dui add dtext $page $lx $L(toolbar_y0) -tags selected_shot -text "" \
-            -font $L(font_body) -width $L(content_w) -fill "#444444" -anchor nw -justify left
+            -font $L(font_body) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
         dui add dtext $page $lx [expr {$L(toolbar_y0)+$L(lg)}] -tags editable_source -text "" \
-            -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor nw -justify left
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor nw -justify left
 
         set row1_y $L(list_top)
-        dui add dtext $page $lx $row1_y -text [translate "Field selector"] \
-            -font $L(font_body) -width $L(label_col_w) -fill "#444444" -anchor nw -justify left
+        dui add dtext $page $lx $row1_y -tags fs_label -text [translate "Field selector"] \
+            -font $L(font_body) -width $L(label_col_w) -fill $L(text_body) -anchor nw -justify left
         dui add dtext $page $vx $row1_y -tags field_value -text "" \
-            -font $L(font_body) -width [expr {$rx-$L(btn_w_wide)-$L(lg)-$vx}] -fill "#4e85f4" -anchor nw -justify left
+            -font $L(font_body) -width [expr {$rx-$L(btn_w_wide)-$L(lg)-$vx}] -fill $L(value_blue) -anchor nw -justify left
         dui add dbutton $page [expr {$rx-$L(btn_w_wide)}] [expr {$row1_y-$L(sm)}] $rx [expr {$row1_y-$L(sm)+$L(btn_h)}] \
             -tags next_field -label [translate "Next Field"] \
             -command ::plugins::ShotHistoryEditor::cycle_edit_field -label_font $L(font_button) -style she_btn
 
         set row2_y [expr {$row1_y+$L(btn_h)+$L(lg)}]
-        dui add dtext $page $lx $row2_y -text [translate "Current value"] \
-            -font $L(font_body) -width $L(label_col_w) -fill "#444444" -anchor nw -justify left
+        dui add dtext $page $lx $row2_y -tags cv_label -text [translate "Current value"] \
+            -font $L(font_body) -width $L(label_col_w) -fill $L(text_body) -anchor nw -justify left
         dui add dtext $page $vx $row2_y -tags current_value -text "" \
-            -font $L(font_body) -width [expr {$rx-$vx}] -fill "#444444" -anchor nw -justify left
+            -font $L(font_body) -width [expr {$rx-$vx}] -fill $L(text_body) -anchor nw -justify left
 
         set row3_y [expr {$row2_y+$L(xxl)}]
         dui add entry $page $lx [expr {$row3_y+$L(xl)}] -tags new_value \
             -textvariable ::plugins::ShotHistoryEditor::edit_new_value \
-            -width 42 -font $L(font_body) -borderwidth 1 -bg #fbfaff -foreground #4e85f4 -relief flat \
+            -width 42 -font $L(font_body) -borderwidth 1 -bg $L(entry_bg) -foreground $L(value_blue) -relief flat \
             -label [translate "New value"] -label_pos [list $lx $row3_y] \
-            -label_font $L(font_body) -label_width $L(label_col_w) -label_fill "#444444"
+            -label_font $L(font_body) -label_width $L(label_col_w) -label_fill $L(text_body)
 
         dui add dbutton $page [expr {$rx-$L(btn_w_wide)}] $row3_y $rx [expr {$row3_y+$L(btn_h)}] \
             -tags preview_change -label [translate "Preview Change"] \
@@ -3232,14 +3462,14 @@ namespace eval ::dui::pages::ShotHistoryEditor_edit_preview {
         # it does not write anything itself.
         set row4_y [expr {$row3_y+$L(btn_h)+$L(md)}]
         dui add dbutton $page [expr {$rx-$L(btn_w_wide)}] $row4_y $rx [expr {$row4_y+$L(btn_h)}] \
-            -tags save_change -label [translate "Save Change"] -label_fill "#c0392b" \
+            -tags save_change -label [translate "Save Change"] -label_fill $L(danger) \
             -command ::plugins::ShotHistoryEditor::open_edit_confirm -label_font $L(font_button) -style she_btn
 
         set status_y [expr {$row4_y+$L(btn_h)+$L(xxl)}]
         dui add dtext $page $lx $status_y -tags preview_status -text "" \
-            -font $L(font_caption) -width $L(content_w) -fill "#7a4b00" -anchor nw -justify left
+            -font $L(font_caption) -width $L(content_w) -fill $L(warn) -anchor nw -justify left
         dui add dtext $page $lx [expr {$status_y+$L(xl)}] -tags preview_text -text "" \
-            -font $L(font_caption) -width $L(content_w) -fill "#444444" -anchor nw -justify left
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
 
         # v0.6.1, owner request: Done sits at the FAR LEFT on this page, not
         # the far right.
@@ -3284,11 +3514,11 @@ namespace eval ::dui::pages::ShotHistoryEditor_diagnostics {
         set lx $L(left_x); set rx $L(right_x); set cx [expr {($lx+$rx)/2}]
 
         dui add dtext $page $cx $L(header_solo_title_y) -tags page_title -text [translate "Diagnostics"] \
-            -font $L(font_section) -width $L(content_w) -fill "#444444" -anchor center -justify center
+            -font $L(font_section) -width $L(content_w) -fill $L(text_body) -anchor center -justify center
         dui add dtext $page $lx $L(toolbar_y0) -tags diagnostics_page_status -text "" \
-            -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor nw -justify left
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor nw -justify left
         dui add dtext $page $lx $L(list_top) -tags diagnostics_text -text "" \
-            -font $L(font_caption) -width $L(content_w) -fill "#444444" -anchor nw -justify left
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
 
         # v0.6.2: the row starts one slot in, because Done now occupies the
         # far-left slot (added at the end of this block).
@@ -3333,12 +3563,12 @@ namespace eval ::dui::pages::ShotHistoryEditor_help {
         set lx $L(left_x); set rx $L(right_x); set cx [expr {($lx+$rx)/2}]
 
         dui add dtext $page $cx $L(header_solo_title_y) -tags page_title -text [translate "Help / Guide"] \
-            -font $L(font_section) -width $L(content_w) -fill "#444444" -anchor center -justify center
+            -font $L(font_section) -width $L(content_w) -fill $L(text_body) -anchor center -justify center
 
         dui add dtext $page $lx $L(toolbar_y0) -tags help_page_status -text "" \
-            -font $L(font_caption) -width $L(content_w) -fill "#666666" -anchor nw -justify left
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor nw -justify left
         dui add dtext $page $lx $L(list_top) -tags help_text -text "" \
-            -font $L(font_body) -width $L(content_w) -fill "#444444" -anchor nw -justify left
+            -font $L(font_body) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
 
         # v0.6.2: the row starts one slot in, because Done now occupies the
         # far-left slot (added at the end of this block).
