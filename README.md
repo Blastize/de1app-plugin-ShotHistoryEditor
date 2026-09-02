@@ -1,7 +1,20 @@
 # Shot History Editor
 
-Version: v0.8.0
+Version: v0.8.1
 Author: Blastize
+
+## Card-list pagination fixes (v0.8.1)
+
+Display/navigation-only bugfix pass; no change to any write capability.
+Prev now really disappears on the first page and Edit buttons on empty
+rows really disappear (dbutton show/hide needs the `<tag>*` wildcard
+form — the bare tag only hides the invisible click area, leaving the
+visible button behind). Next stops at the last shot and disappears on
+the last page: the page offset is clamped to the real end, and the
+shot total is now counted with exactly the pager's own filters (the old
+count subtracted trashed shots twice once SDB's resync flagged them
+`removed=1`, so paging could pass the reported total). The same
+wildcard fix was applied to the Trash/Restore page's buttons.
 
 ## Dark mode (v0.8.0)
 
@@ -43,8 +56,6 @@ registered with `-theme default` and explicit fills, and every page paints
 its own full-page grey background first. No write behavior changed.
 
 Shot History Editor is a Decent Espresso DE1app plugin for browsing and inspecting saved shot metadata across SDB, legacy `history/*.shot`, and `history_v2/*.json`. It can soft-delete shots (move their files to a plugin trash folder, restorable, since v0.4.0) and, as of v0.5.0, really save an edited metadata field back into `history/<filename>.shot`. SDB is never written to in either case.
-
-<img src="images/main_list.png" alt="Shot History Editor main card list" width="740">
 
 ## Pass 5.3 Scope -- Delete/Edit Flow Navigation Bugfix (bugfix only, no write behavior changes; root cause confirmed from core source and reproduced offline)
 

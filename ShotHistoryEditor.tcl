@@ -2437,13 +2437,40 @@ proc ::plugins::ShotHistoryEditor::_total_shot_count {} {
     return $n
 }
 
-# Raw SDB count minus shots hidden by the trash manifest -- SDB itself is
-# never touched by delete, so this is the only place that combines the two.
+# Count of shots the card pager can actually reach: the SAME removed-column
+# filter and the SAME trash-manifest filename filter as
+# load_recent_shots_paged, so "Showing x-y of N" and the last page always
+# agree. v0.8.1 bugfix: the old version subtracted the WHOLE trash manifest
+# from SDB's raw count, but SDB's own resync also flags trashed files
+# removed=1 -- those shots were then subtracted twice, under-reporting the
+# total (tablet showed "Showing 121-121 of 106 shots") while Next kept
+# finding real rows past the fake total.
 proc ::plugins::ShotHistoryEditor::_visible_shot_count {} {
-    set total [_total_shot_count]
-    if {$total eq ""} { return "" }
-    set n [expr {$total - [deleted_shot_count]}]
-    if {$n < 0} { set n 0 }
+    set n ""
+    set db [_open_ro_db]
+    if {$db eq ""} { return $n }
+    set table [_choose_source $db]
+    if {$table ne ""} {
+        set cols [_columns $db $table]
+        set where ""
+        if {[_has_col $cols removed]} { set where " WHERE (removed IS NULL OR removed=0)" }
+        if {[_has_col $cols filename]} {
+            set deleted [_deleted_filenames_dict]
+            set count 0
+            if {![catch {
+                $db eval "SELECT [_q filename] AS fn FROM [_q $table]$where" row {
+                    if {![dict exists $deleted $row(fn)]} { incr count }
+                }
+            }]} {
+                set n $count
+            }
+        } else {
+            # No filename column detected: the pager cannot filter by the
+            # trash manifest either, so the raw count IS the reachable count.
+            catch { set n [$db onecolumn "SELECT COUNT(*) FROM [_q $table]$where"] }
+        }
+    }
+    _close_db
     return $n
 }
 
@@ -2801,18 +2828,21 @@ proc ::plugins::ShotHistoryEditor::refresh_trash_page {page} {
             set text "$friendly  |  [dict get $b shot_count] shot(s), [dict get $b file_count] file(s)  |  batch [dict get $b batch_id]"
             catch { dui item config $page row${i}_text -text $text }
             catch { dui item show $page row${i}_text }
-            catch { dui item show $page row${i}_restore }
+            catch { dui item show $page row${i}_restore* -initial 1 }
         } else {
             catch { dui item config $page row${i}_text -text "" }
             catch { dui item hide $page row${i}_text }
-            catch { dui item hide $page row${i}_restore }
+            catch { dui item hide $page row${i}_restore* -initial 1 }
         }
     }
 
+    # v0.8.1: wildcard tag form for dbutton show/hide -- see the note in
+    # refresh_main_page. The old bare-tag hides left dead-but-visible
+    # Restore/Prev buttons on this page too.
     if {$trash_offset > 0} {
-        catch { dui item show $page trash_prev_page }
+        catch { dui item show $page trash_prev_page* -initial 1 }
     } else {
-        catch { dui item hide $page trash_prev_page }
+        catch { dui item hide $page trash_prev_page* -initial 1 }
     }
 }
 
@@ -2833,6 +2863,21 @@ proc ::plugins::ShotHistoryEditor::refresh_main_page {page} {
     variable last_error
     variable select_mode
 
+    # v0.8.1: clamp the offset to the last real page BEFORE loading, using
+    # the same-filtered count (see _visible_shot_count), so Next can never
+    # walk past the end and a delete that shrinks the list snaps the view
+    # back to the last page instead of stranding it on an empty one.
+    set total [_visible_shot_count]
+    if {$total ne ""} {
+        if {$total <= 0} {
+            set card_offset 0
+        } else {
+            set max_offset [expr {(($total - 1) / $card_page_size) * $card_page_size}]
+            if {$card_offset > $max_offset} { set card_offset $max_offset }
+        }
+    }
+    if {$card_offset < 0} { set card_offset 0 }
+
     load_recent_shots_paged $card_offset $card_page_size
     set shown [llength $card_rows]
 
@@ -2843,7 +2888,6 @@ proc ::plugins::ShotHistoryEditor::refresh_main_page {page} {
         set status "No recent SDB shots found."
         if {$last_error ne ""} { append status "\n$last_error" }
     } else {
-        set total [_visible_shot_count]
         set from [expr {$card_offset + 1}]
         set to [expr {$card_offset + $shown}]
         if {$total ne ""} {
@@ -2872,14 +2916,14 @@ proc ::plugins::ShotHistoryEditor::refresh_main_page {page} {
             set line2 "Grind [_display [_dget $row grinder_setting]]   Dose [_display [_dget $row grinder_dose_weight]]g   Yield [_display [_dget $row drink_weight]]g   |   [_display [_dget $row extraction_time]]s"
             set line3 "Bean: $bean   |   Profile: $profile"
 
-            catch { dui item show $page row${i}_bg }
+            catch { dui item show $page row${i}_bg -initial 1 }
             catch { dui item config $page row${i}_line1 -text $line1 }
             catch { dui item config $page row${i}_line2 -text $line2 }
             catch { dui item config $page row${i}_line3 -text $line3 }
-            catch { dui item show $page row${i}_line1 }
-            catch { dui item show $page row${i}_line2 }
-            catch { dui item show $page row${i}_line3 }
-            catch { dui item show $page row${i}_btn }
+            catch { dui item show $page row${i}_line1 -initial 1 }
+            catch { dui item show $page row${i}_line2 -initial 1 }
+            catch { dui item show $page row${i}_line3 -initial 1 }
+            catch { dui item show $page row${i}_btn* -initial 1 }
 
             if {$select_mode} {
                 catch { dui item config $page row${i}_btn -label [translate [expr {[_is_selected $filename] ? "☑ Selected" : "☐ Select"}]] }
@@ -2887,21 +2931,39 @@ proc ::plugins::ShotHistoryEditor::refresh_main_page {page} {
                 catch { dui item config $page row${i}_btn -label [translate "✎ Edit"] }
             }
         } else {
-            catch { dui item hide $page row${i}_bg }
+            catch { dui item hide $page row${i}_bg -initial 1 }
             catch { dui item config $page row${i}_line1 -text "" }
             catch { dui item config $page row${i}_line2 -text "" }
             catch { dui item config $page row${i}_line3 -text "" }
-            catch { dui item hide $page row${i}_line1 }
-            catch { dui item hide $page row${i}_line2 }
-            catch { dui item hide $page row${i}_line3 }
-            catch { dui item hide $page row${i}_btn }
+            catch { dui item hide $page row${i}_line1 -initial 1 }
+            catch { dui item hide $page row${i}_line2 -initial 1 }
+            catch { dui item hide $page row${i}_line3 -initial 1 }
+            catch { dui item hide $page row${i}_btn* -initial 1 }
         }
     }
 
+    # v0.8.1: dbutton show/hide MUST use the wildcard tag form. dui gives a
+    # dbutton's visible shape/label their own -btn/-lbl tags plus a shared
+    # literal "<tag>*" tag (de1app-core/dui.tcl process_tags_and_var); the
+    # bare tag only matches the invisible clickable rect, so the old bare-tag
+    # hides left Prev and the empty rows' Edit buttons fully visible (but
+    # dead) on the tablet. Same form every reference plugin uses (A_Flow,
+    # DPx_Flow_Calibrator: "dui item hide <page> <tag>*"). -initial 1 also
+    # persists the state through the framework's pre-show{} re-show of all
+    # items, so hidden buttons cannot flash back on a page revisit.
     if {$card_offset > 0} {
-        catch { dui item show $page prev_page }
+        catch { dui item show $page prev_page* -initial 1 }
     } else {
-        catch { dui item hide $page prev_page }
+        catch { dui item hide $page prev_page* -initial 1 }
+    }
+    # Next hides on the last page (offset+shown reaches the clamped total).
+    # When the total is unknown (SDB unreadable), fall back to "a full page
+    # probably has a next one".
+    if {($total ne "" && $card_offset + $shown < $total) ||
+        ($total eq "" && $shown == $card_page_size)} {
+        catch { dui item show $page next_page* -initial 1 }
+    } else {
+        catch { dui item hide $page next_page* -initial 1 }
     }
 }
 
