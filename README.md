@@ -1,5 +1,37 @@
 # Shot History Editor
 
+**Browse your shots as cards, fix a wrong grind or bean name, delete mistakes to a restorable trash.**
+Version v0.13.0 · a plugin for the Decent DE1app · by Blastize
+
+![The shot list: five cards per page with grind, dose, yield, time, bean and profile](docs/shot_list.png)
+
+**Your shots as cards.** Grind, dose, yield, time, bean and profile, five per page, newest first. Edit on the card, Select to pick shots for the trash.
+
+![Edit Preview: pick one field, type the new value, preview before and after, then save](docs/edit_preview.png)
+
+**Edit one field.** Pick the field, type the value, preview the before and after, then save. Only that one line of the shot file changes, after a backup. The shot database is never written.
+
+![Trash / Restore: deleted shots in batches, each with a Restore button](docs/trash.png)
+
+**Trash and restore.** Deleting moves the files into the plugin's own trash, in batches. Restore puts a batch back. Emptying the trash is a separate, typed confirmation.
+
+![Source Inspector: the raw shot rows the database knows about](docs/source_inspector.png)
+
+**Source Inspector.** The raw rows behind the cards, for when you want to see exactly what the database recorded.
+
+## Install
+
+Copy the folder to `de1plus/plugins/ShotHistoryEditor/`, restart the app, enable **Shot History Editor** under Extensions.
+
+## Safety
+
+SDB is read-only. Edits rewrite exactly one line of one `.shot` file after a whole-file backup. Deletes move files into the plugin's trash and are logged; only Empty trash deletes for good, only inside that trash folder, after a typed confirmation. Raw pressure, flow and temperature data are never shown or edited.
+
+<details>
+<summary><b>Full reference and version notes</b></summary>
+
+## Reference
+
 Version: v0.13.0
 Author: Blastize
 
@@ -378,3 +410,5 @@ Known limitations:
 - The card list's Next button is always shown (no total-row count gates it); paging past the last page shows an empty list with a status message instead of disabling Next.
 - `page_line_count` (the number of text lines shown per page on Detail/Diagnostics/Help) is unchanged from v0.2.0 per "do not change plugin logic" -- its visual fit now depends on the real screen height and the new caption font size, and may want tuning in a future pass.
 - The `she_btn` dui aspect style (shared button corner radius + font) is a best-effort use of the framework's documented aspect keys (`shape round radius N`, `font_family`/`font_size`); no other plugin in this workspace defines a custom aspect style, so it's wrapped in `catch` and falls back to whatever the framework's default button look is if those keys aren't accepted.
+
+</details>
