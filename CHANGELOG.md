@@ -4,6 +4,244 @@ Note: entries follow the CLAUDE.md doc cap (about 15 lines each; entries that ad
 changed a write capability keep their full write-path description). The long pre-trim
 entries survive in the Desktop archive snapshot of each version.
 
+## v0.13.0 - Tidy empty trash folders (2026-09-18)
+
+Base: v0.12.0. Restore never removed an emptied batch folder (14 on the tablet). CLAUDE.md's
+exception now also names EMPTY batch folders directly under the trash (owner-approved).
+
+- `_remove_empty_trash_dirs`: removes every EMPTY folder directly under the plugin trash
+  (`_inside_trash_dir` guard; a folder holding anything stays). Holds the plugin's only
+  folder `file delete`; `perform_purge` calls it after its file pass and reports
+  `folders_removed` (result page + PURGE log line).
+- Advanced > "Tidy empty trash folders" calls it alone: one TIDY line in delete_log.txt,
+  result in the Advanced note (`refresh_advanced_page`, cleared on next show).
+- Preview page states the empty-folder count; Advanced subtitle drops "read-only".
+- Offline fixture: two empty folders removed; a folder with a file and a stray file under
+  the trash kept; TIDY logged; purge reports folders_removed. verify.sh pass 11: PASS on
+  run 2 (run 1 failed only on my check expecting 14 empty folders; the tablet has 13, and
+  one untracked non-empty folder that both sweeps correctly leave alone).
+
+**Safety: the permanent-deletion capability (v0.12.0) is extended to EMPTY folders directly
+under plugins/ShotHistoryEditor/trash/ only. Still exactly two `file delete` lines, both
+tagged `;# purge-only`; 11 write-mode opens; no other write path changed.** Files:
+ShotHistoryEditor.tcl, plugin.tcl, README.md, CHANGELOG.md, PROJECT_STATE.md; CLAUDE.md.
+
+## v0.12.0 - real Empty trash: PERMANENT deletion (2026-09-18)
+
+Base: v0.11.0. Owner decision after the preview and after the concern was raised:
+CLAUDE.md's "never permanent deletion" now carries ONE exception for this plugin's own
+trash folder, and loop/verify.sh exempts only `file delete` lines tagged `;# purge-only`.
+Sixth write capability; first permanent deletion; clearly flagged.
+
+- UI: preview page far-right red "Empty trash" (hidden while the trash is empty) ->
+  `ShotHistoryEditor_purge_confirm` (type the batch count; entry in the top half) ->
+  "Remove permanently" -> `ShotHistoryEditor_purge_result` -> Done returns to Trash.
+- Write path, in full (`perform_purge`, called only from `confirm_purge_submit`):
+  1. refuses unless the batch set equals the snapshot taken when the confirmation opened;
+  2. per manifest line: trash path must resolve strictly inside
+     plugins/ShotHistoryEditor/trash/ (`_inside_trash_dir`; else kept + logged SKIPPED) and
+     be a listed file (else logged "already gone", line dropped);
+  3. ONE `file delete` per file; ONE `file delete` per batch folder only when it is empty
+     (a folder with unknown files stays);
+  4. every file -> purge_log.txt `ts|batch|orig|trash|bytes|status` (append-only); the
+     trash manifest is rewritten without the removed lines; delete_log.txt gets one PURGE
+     summary; a NOTICE is logged.
+  history/, history_v2/ and SDB are never touched. No undo.
+- Help line updated. Offline fixture: two batches purged; an outside-trash manifest line
+  kept and its file untouched; an already-gone line dropped; empty batch folders removed,
+  a folder with a stray file kept; logs/manifest correct; batch-set mismatch and wrong
+  typed count refuse with nothing removed.
+- verify.sh pass 10: PASS first run (pages incl. the two new ones, `file delete` pinned to
+  exactly 2 tagged lines, write-mode opens 10, logcat free of "Empty trash removed": the
+  tablet's 7 batches are untouched). Screenshots checked by eye.
+
+**Safety: this version ADDS permanent deletion, limited to files inside the plugin's own
+trash folder that the trash manifest lists, behind a typed confirmation, with a per-file
+audit log. Exactly two `file delete` lines exist and both are tagged `;# purge-only`.
+Edit/soft-delete/restore/unhide are untouched; history files are never deleted.** Files:
+ShotHistoryEditor.tcl, plugin.tcl, README.md, CHANGELOG.md, PROJECT_STATE.md; workspace:
+CLAUDE.md (rule exception), loop/verify.sh (audit exemption).
+
+## v0.11.0 - Empty trash, PREVIEW stage (2026-09-18)
+
+Base: v0.10.0. Owner asked for Empty trash; CLAUDE.md says "never permanent deletion" and
+verify.sh rejects `file delete`, so this is the preview stage of the destructive process.
+
+- Trash page: far-right "Empty trash..." opens "Empty trash - preview" (paged text,
+  Done/Back return to Trash). `empty_trash_preview_text`: per batch date, id, shots, files
+  present/missing, bytes, age; totals a future Empty trash would remove; states nothing
+  is deleted and manifest + delete log would stay as audit. Help line updated.
+- Offline fixture (known sizes, one file missing): totals correct, nothing written.
+  verify.sh pass 09: PASS first run (nine pages, `file delete` grep 0, write counts
+  unchanged); tablet preview 7 batches / 15 shots / 30 files / 1.2 MB; screenshots checked.
+
+**Safety: no change to the write capability; the new page is read-only. Permanent deletion
+does not exist; a real Empty trash needs the "never permanent deletion" rule and the harness
+audit amended first, in its own pass.** Files: ShotHistoryEditor.tcl, plugin.tcl, README.md,
+CHANGELOG.md, PROJECT_STATE.md.
+
+## v0.10.0 - reconcile action "Unhide" (2026-09-17)
+
+Base: v0.9.1. Owner-authorized fifth write capability (minor bump, flagged). The v0.9.0
+view only reported; this adds the one action for a shot that is on disk again while a
+trash-manifest line still hides it.
+
+- Reconcile page is now a row list (6 per page, Trash-style Prev/Next pager, 60 px
+  buttons, three caption lines per row) with an Unhide button per shot.
+- Write path, in full: `perform_unhide ts orig batch` refuses unless that manifest line
+  still exists, the file is on disk, and it was not unhidden before; then it APPENDS one
+  line `unhidden_at|ts|orig|batch` to plugins/ShotHistoryEditor/reconcile_manifest.txt
+  and one `RECONCILE UNHIDE orig=... batch=...` line to delete_log.txt, and logs at INFO.
+  Nothing else is written: the trash manifest is never edited, no file moves, history/
+  and history_v2/ are untouched, SDB is untouched. No backup is needed because no
+  existing byte changes; the append-only files are the audit.
+- Effect: `_deleted_filenames_dict` and `_reconcile_records` skip manifest lines whose
+  key (ts|orig|batch) is in the reconcile manifest. The shot reappears in the card list
+  and Source Inspector; the trash entry and any trash copy stay tracked, so the Trash page
+  is unchanged and Restore keeps reporting the collision. Undo = delete the shot again
+  (a new manifest line, new key, hides it again).
+- Help page: a Reconcile paragraph added; the v0.5.0 save paragraph tightened to make
+  room (the block had 36 virtual px left above the bottom bar; verify.sh run 1 caught
+  the overflow).
+- Offline fixture: stale line and two-file collision unhidden; trash manifest
+  byte-identical afterwards; files untouched; bogus key refused with no write; re-delete
+  hides again. Nets: check_header_gap.tcl covers the new rows.
+- verify.sh pass 08: PASS on run 2 (eight pages incl. the empty state, write-count greps:
+  8 write-mode opens, exactly one on the reconcile manifest, logcat); help block ends 56
+  virtual px above the bar. Screenshots checked by eye.
+
+**Safety: this version ADDS a write capability (the fifth): append-only writes to two
+plugin-owned files, reconcile_manifest.txt and delete_log.txt. Edit/soft-delete/restore
+are untouched; no change to the write capability against history files; SDB never
+written; `file delete` still absent.** Files: ShotHistoryEditor.tcl, plugin.tcl, README.md,
+CHANGELOG.md, PROJECT_STATE.md, tools/check_header_gap.tcl.
+
+## v0.9.1 - Trash page Next button (2026-09-17)
+
+Base: v0.9.0. Tablet-found the same day: Trash had Prev but no Next, so with more than
+6 batches the older ones were unreachable ("Showing 1-6 of 7").
+
+- `trash_next_page` dbutton beside Prev, shown only while more batches follow (hidden on
+  the last page and on an empty list), `<tag>*` + `-initial 1` form.
+- `refresh_trash_page` clamps the offset to the last real page (card-list rule since
+  v0.8.1), so over-scrolling or a restore that empties the last page cannot strand the view.
+- New regression net `tools/check_trash_pager.tcl` (7-batch fixture: page 1, Next, clamp,
+  Prev, empty list). verify.sh pass 07: PASS first tablet run ("Showing 1-6 of 7", Next
+  visible, Prev hidden on the screenshot; seven pages, greps, logcat).
+
+**Safety: no change to the write capability (edit/soft-delete/restore untouched); no SQL
+or data change - display and paging only.** Files: ShotHistoryEditor.tcl, plugin.tcl,
+README.md, CHANGELOG.md, PROJECT_STATE.md, tools/check_trash_pager.tcl.
+
+## v0.9.0 - reconciliation view, read-only (2026-09-17)
+
+Base: v0.8.6. Surfaces the v0.7.0 finding ("file exists on disk but manifest says deleted").
+
+- New page Advanced > "Reconcile hidden shots" (Diagnostics skeleton, paged text).
+  `_reconcile_records` = every manifest .shot line whose original path exists again;
+  `reconcile_text` reports deleted when/batch, on-disk mtime, trash copy present (two
+  files) or missing (stale line), and SDB's view via one read-only SELECT.
+- Advanced's note appends "N of them exist on disk again"; Diagnostics gains the count.
+- Offline fixture: stale line / two-file collision / absent shot classified correctly,
+  nothing moved. verify.sh pass 06: PASS on run 2 (run 1 failed only on a check that
+  expected a Diagnostics line that lands on page 2). Screenshots checked by eye.
+
+**Safety: no change to the write capability (edit/soft-delete/restore untouched). The
+new page is READ-ONLY: no action buttons, no manifest write, no file move; write-call
+counts are pinned by the pass greps.** Files: ShotHistoryEditor.tcl, plugin.tcl,
+README.md, CHANGELOG.md, PROJECT_STATE.md.
+
+## v0.8.6 - Source Inspector 7-row list (2026-09-17)
+
+Base: v0.8.5. Owner-approved behaviour change, follow-up to the v0.8.5 note.
+
+- `max_recent` 8 -> 7: the Source Inspector lists the latest 7 SDB shots, so its Open
+  buttons reach the 60 px touch minimum (52-53 px at 8 rows). `max_recent` is now the
+  single source for the page's `n_rows`, the refresh loop (was a hard-coded 8) and the
+  query scan cap; `row7_open` left the retheme list.
+- `tools/check_header_gap.tcl` asserts every row button on both pages is >= btn_h.
+- verify.sh pass 05: PASS first tablet run (six pages, "Showing latest 7 SDB shots", all
+  seven Open buttons measured 60 px, greps, logcat); screenshot checked by eye.
+
+**Safety: no change to the write capability (edit/soft-delete/restore untouched); no
+SQL, navigation or data change - one fewer row is read and shown.** Files:
+ShotHistoryEditor.tcl, plugin.tcl, README.md, CHANGELOG.md, PROJECT_STATE.md,
+tools/check_header_gap.tcl.
+
+## v0.8.5 - polish batch (2026-09-17)
+
+Base: v0.8.4. Polish lane: the three notes left by the 2026-09-17 review, one bump.
+
+- Trash Restore / Source Inspector Open buttons: rows are centred bands, button height
+  `row_btn_h` = min(btn_h, row_h - sm): Trash 60 px (touch minimum), Source Inspector
+  ~53 px (8 rows; the full 60 needs a 7-row list = behaviour change). Was 42 px.
+- Glyph literals (pencil, arrows, checkboxes; six lines) come from code points via the
+  one-line `_u` helper (`format %c`, always fully qualified): ASCII source, identical
+  rendering, each label keeps its text. Not `dui symbol get`: a dbutton label is one
+  text item in one font, so a Font Awesome glyph cannot share it with Helvetica.
+- `desktop.ini` removed from the plugin folder (workspace and tablet).
+- verify.sh pass 04: PASS first tablet run (six pages, "no non-ASCII byte" grep, logcat);
+  Restore 60 px / Open 52-53 px measured, glyphs render, screenshots checked by eye.
+
+**Safety: no change to the write capability (edit/soft-delete/restore untouched); no
+SQL, navigation, behaviour or data change.** Files: ShotHistoryEditor.tcl, plugin.tcl,
+README.md, CHANGELOG.md, PROJECT_STATE.md.
+
+## v0.8.4 - header/row gap on Trash + Source Inspector (2026-09-17)
+
+Base: v0.8.3. Tablet-found by verify.sh pass 02: the column header (caption font, 38
+virtual px tall) started only md (32) above row 0 on both pages, so the lines touched.
+
+- New layout token `L(caption_h)`: caption line height in virtual units, from
+  `font metrics -linespace` (physical) x sh/psh; fallback 1.25 x 16 px x scale.
+- Both pages start their list at `header_y + caption_h + md`; the 6 (Trash) and 8
+  (Source Inspector) rows redistribute over the remaining space above the bottom bar.
+- New offline net `tools/check_header_gap.tcl` (header gap, row spacing, bottom
+  clearance); `tools/check_bars.tcl` still passes.
+- verify.sh pass 03: PASS first run (six pages incl. the two fixed ones, greps, logcat);
+  header 324-362 vs row 0 from 398 virtual on both pages; screenshots checked by eye.
+
+**Safety: no change to the write capability (edit/soft-delete/restore untouched); no
+SQL, navigation or data change.** Files: ShotHistoryEditor.tcl, plugin.tcl, README.md,
+CHANGELOG.md, PROJECT_STATE.md, tools/check_header_gap.tcl.
+
+## v0.8.3 - review follow-ups (2026-09-17)
+
+Base: v0.8.2. Four hygiene findings from the 2026-09-17 code review.
+
+- `msg` wrapper: core logging.tcl reads a severity flag only in position one, so the six
+  `-NOTICE`/`-INFO` calls logged at INFO with the flag as text; a leading flag is hoisted.
+- `_navigate_done`: both `close_dialog` fallbacks log via `msg -ERROR` instead of bare catch.
+- Five Back buttons (Trash, Source Inspector, Detail, Diagnostics, Help) use
+  `_return_to_page` like the Done beside each, not `open_page` on an ancestor.
+- Source Inspector Open buttons show/hide with `-initial 1` (v0.8.1 form).
+- verify.sh pass 02: version, greps, logcat, 4 of 6 pages PASS; Trash and Source Inspector
+  FAIL a pre-existing header/row proximity check (header bottom 362 vs row top 356,
+  virtual). Not touched here; its own layout pass. Offline byte-compile + wrapper test: pass.
+
+**Safety: no change to the write capability (edit/soft-delete/restore untouched); no
+SQL, layout or data change.** Files: ShotHistoryEditor.tcl, plugin.tcl, README.md,
+CHANGELOG.md, PROJECT_STATE.md.
+
+## v0.8.2 - idempotent SDB close (2026-09-15)
+
+Base: v0.8.1. Same defect MaintenanceTracker v0.21.3 fixed the same day.
+
+- `_close_db` was a bare `catch { $db_handle close }`. Every reader closes the handle
+  when done and `_open_ro_db` closes it again before opening, so the pre-open close
+  failed on every open. catch swallowed the error but left `$::errorInfo` dirty; the
+  core BLE runner prints `$::errorInfo` whenever a queued command returns non-1
+  (de1_comms.tcl:120), so SHE's error could surface as `BLE error info invalid
+  command name "::plugins::ShotHistoryEditor::__sdb_ro"`.
+- Fix: close only when `info commands $db_handle` is non-empty; a real close failure
+  is logged via `msg`. All 9 close sites (before open + after each reader) go through
+  it; no reader touches the handle after closing.
+
+**Safety: no change to the write capability (edit/soft-delete/restore untouched); the
+SDB handle stays read-only and no SQL changed.**
+
+Files: ShotHistoryEditor.tcl, plugin.tcl, README.md, CHANGELOG.md, PROJECT_STATE.md.
+
 ## v0.8.1 - card-list pagination fixes
 
 Base: v0.8.0. Three owner-reported bugs from tablet screenshots, two root causes.

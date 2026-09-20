@@ -34,11 +34,32 @@ namespace eval ::plugins::ShotHistoryEditor {
     variable last_error ""
     variable table_used ""
     variable detected_objects {}
-    variable max_recent 8
+    # v0.8.6: 7 (was 8) so the Source Inspector's Open buttons reach the
+    # design-system 60 px touch minimum inside their row band. The page's
+    # row count, the refresh loop and the SQL scan cap all read this.
+    variable max_recent 7
     variable detail_page_index 0
     variable diagnostics_page_index 0
     variable help_page_index 0
     variable delete_review_page_index 0
+    # v0.10.0: the reconciliation view is a row list with an Unhide button per
+    # row (was paged text in v0.9.0); same pager shape as the Trash page.
+    variable reconcile_offset 0
+    variable reconcile_page_size 6
+    variable reconcile_note ""
+    # v0.11.0: "Empty trash" PREVIEW page (paged text). Nothing is deleted in
+    # this version; see empty_trash_preview_text.
+    variable empty_preview_page_index 0
+    # v0.12.0: real Empty trash. Snapshot of the batch ids taken when the
+    # confirmation opens (perform_purge refuses if the set changed), the typed
+    # confirmation, and the result text.
+    variable purge_batch_ids {}
+    variable purge_input ""
+    variable purge_error ""
+    variable purge_result_text ""
+    # v0.13.0: Advanced > Tidy result, shown in the Advanced note until the
+    # page is next shown.
+    variable tidy_note ""
     variable page_line_count 22
     variable editable_fields {grinder_setting grinder_dose_weight drink_weight bean_brand bean_type espresso_notes my_name drinker_name}
     variable edit_field "grinder_setting"
@@ -95,8 +116,17 @@ namespace eval ::plugins::ShotHistoryEditor {
     variable edit_result_text ""
 }
 
+# v0.8.3: the core logger honours a severity flag (-NOTICE, -INFO, ...)
+# only in argument position one (logging.tcl default_logger). This wrapper
+# used to put the namespace first, so every flagged call logged at the
+# default INFO level with the flag as literal text. A leading flag is now
+# hoisted ahead of the namespace, matching how the core itself calls msg.
 proc ::plugins::ShotHistoryEditor::msg {args} {
-    catch { ::msg [namespace current] {*}$args }
+    if {[string index [lindex $args 0] 0] eq "-"} {
+        catch { ::msg [lindex $args 0] [namespace current] {*}[lrange $args 1 end] }
+    } else {
+        catch { ::msg [namespace current] {*}$args }
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -205,6 +235,14 @@ proc ::plugins::ShotHistoryEditor::_glyph_for {name} {
     return $glyph
 }
 
+# v0.8.5: label glyphs (pencil, arrows, checkboxes) are built from their
+# code points so the source stays plain ASCII (CLAUDE.md rule) and no editor
+# or tool can mangle a raw character or a backslash escape. Every label that
+# uses one keeps its plain-text word beside it as the fallback.
+proc ::plugins::ShotHistoryEditor::_u {code} {
+    return [format %c $code]
+}
+
 # Moon in light mode (tap for dark), sun-bright in dark; text fallback.
 proc ::plugins::ShotHistoryEditor::_theme_button_face {} {
     variable L
@@ -241,7 +279,9 @@ proc ::plugins::ShotHistoryEditor::_retheme_all {} {
                ShotHistoryEditor_recent ShotHistoryEditor_detail
                ShotHistoryEditor_edit_preview ShotHistoryEditor_edit_confirm
                ShotHistoryEditor_edit_result ShotHistoryEditor_diagnostics
-               ShotHistoryEditor_help} {
+               ShotHistoryEditor_help ShotHistoryEditor_reconcile
+               ShotHistoryEditor_empty_preview ShotHistoryEditor_purge_confirm
+               ShotHistoryEditor_purge_result} {
         catch { dui item config $p page_bg -fill $L(page_bg) -outline $L(page_bg) }
     }
     # Text roles: {page tag role} triplets.
@@ -295,6 +335,17 @@ proc ::plugins::ShotHistoryEditor::_retheme_all {} {
         ShotHistoryEditor_help page_title text_body
         ShotHistoryEditor_help help_page_status text_mut
         ShotHistoryEditor_help help_text text_body
+        ShotHistoryEditor_reconcile page_title text_body
+        ShotHistoryEditor_reconcile reconcile_status text_mut
+        ShotHistoryEditor_reconcile header text_body
+        ShotHistoryEditor_empty_preview page_title text_body
+        ShotHistoryEditor_empty_preview empty_preview_page_status text_mut
+        ShotHistoryEditor_empty_preview empty_preview_text text_body
+        ShotHistoryEditor_purge_confirm page_title danger
+        ShotHistoryEditor_purge_confirm purge_instructions text_body
+        ShotHistoryEditor_purge_confirm purge_error_text danger
+        ShotHistoryEditor_purge_result page_title text_body
+        ShotHistoryEditor_purge_result purge_result_text text_body
     } {
         catch { dui item config $p $tag -fill $L($role) }
     }
@@ -307,11 +358,15 @@ proc ::plugins::ShotHistoryEditor::_retheme_all {} {
         catch { dui item config ShotHistoryEditor_settings row${i}_line3 -fill $L(text_mut) }
         catch { dui item config ShotHistoryEditor_trash row${i}_text -fill $L(text_body) }
         catch { dui item config ShotHistoryEditor_recent row${i}_text -fill $L(text_body) }
+        catch { dui item config ShotHistoryEditor_reconcile row${i}_text -fill $L(text_body) }
     }
     # Entries (Tk widgets; their attached labels are -lbl sub-items).
     catch { dui item config ShotHistoryEditor_delete_confirm confirm_entry \
         -bg $L(entry_danger_bg) -foreground $L(danger) }
     catch { dui item config ShotHistoryEditor_delete_confirm confirm_entry-lbl -fill $L(text_body) }
+    catch { dui item config ShotHistoryEditor_purge_confirm purge_entry \
+        -bg $L(entry_danger_bg) -foreground $L(danger) }
+    catch { dui item config ShotHistoryEditor_purge_confirm purge_entry-lbl -fill $L(text_body) }
     catch { dui item config ShotHistoryEditor_edit_preview new_value \
         -bg $L(entry_bg) -foreground $L(value_blue) }
     catch { dui item config ShotHistoryEditor_edit_preview new_value-lbl -fill $L(text_body) }
@@ -319,22 +374,28 @@ proc ::plugins::ShotHistoryEditor::_retheme_all {} {
     foreach {p tags} {
         ShotHistoryEditor_settings {mode_btn prev_page next_page bar_left bar_right btn_theme
                                     row0_btn row1_btn row2_btn row3_btn row4_btn}
-        ShotHistoryEditor_advanced {source_inspector diagnostics help_guide trash_restore back}
+        ShotHistoryEditor_advanced {source_inspector diagnostics help_guide trash_restore reconcile tidy back}
         ShotHistoryEditor_delete_review {cancel continue_btn}
         ShotHistoryEditor_delete_confirm {cancel confirm_delete}
         ShotHistoryEditor_delete_result {page_done}
         ShotHistoryEditor_edit_confirm {cancel save_change}
         ShotHistoryEditor_edit_result {page_done}
-        ShotHistoryEditor_trash {page_done back trash_prev_page
+        ShotHistoryEditor_trash {page_done back trash_prev_page trash_next_page empty_preview
                                  row0_restore row1_restore row2_restore row3_restore
                                  row4_restore row5_restore row6_restore row7_restore}
         ShotHistoryEditor_recent {page_done back
                                   row0_open row1_open row2_open row3_open
-                                  row4_open row5_open row6_open row7_open}
+                                  row4_open row5_open row6_open}
         ShotHistoryEditor_detail {page_done back prev_page next_page edit_preview}
         ShotHistoryEditor_edit_preview {next_field preview_change save_change page_done back}
         ShotHistoryEditor_diagnostics {back prev_page next_page page_done}
         ShotHistoryEditor_help {back prev_page next_page page_done}
+        ShotHistoryEditor_reconcile {page_done back reconcile_prev_page reconcile_next_page
+                                     row0_unhide row1_unhide row2_unhide row3_unhide
+                                     row4_unhide row5_unhide}
+        ShotHistoryEditor_empty_preview {back prev_page next_page page_done empty_now}
+        ShotHistoryEditor_purge_confirm {cancel purge_confirm_btn}
+        ShotHistoryEditor_purge_result {page_done}
     } {
         foreach t $tags {
             catch { dui item config $p ${t}-btn \
@@ -346,6 +407,8 @@ proc ::plugins::ShotHistoryEditor::_retheme_all {} {
         ShotHistoryEditor_delete_confirm confirm_delete
         ShotHistoryEditor_edit_confirm save_change
         ShotHistoryEditor_edit_preview save_change
+        ShotHistoryEditor_empty_preview empty_now
+        ShotHistoryEditor_purge_confirm purge_confirm_btn
     } {
         catch { dui item config $p ${t}-lbl -fill $L(danger) }
     }
@@ -471,6 +534,18 @@ proc ::plugins::ShotHistoryEditor::_init_layout {} {
 
     # v0.8.0: icon font for the theme toggle's sun/moon face (the app's
     # own FA6 Pro file, dui's loader; text fallback when unavailable).
+    # v0.8.4: line height of the caption font in VIRTUAL units, for stacking
+    # a text line above another item (the Trash / Source Inspector column
+    # header sat 32 virtual px above row 0 while the caption line is 38
+    # tall: tablet-found overlap, verify.sh pass 02). `font metrics` answers
+    # in physical px; the y axis maps physical -> virtual by sh/psh. The
+    # fallback is 1.25 x the 16 px reference when no font system exists.
+    set L(caption_h) [expr {int(ceil(16 * 1.25 * $scale))}]
+    catch {
+        set lh [font metrics $L(font_caption) -linespace]
+        if {$lh > 0} { set L(caption_h) [expr {int(ceil($lh * double($sh) / $psh))}] }
+    }
+
     set L(have_icons) 0
     set L(font_icon) $L(font_button)
     catch {
@@ -571,6 +646,10 @@ proc ::plugins::ShotHistoryEditor::preload_pages {} {
     dui page add ShotHistoryEditor_edit_result -namespace true -theme default -type fpdialog
     dui page add ShotHistoryEditor_diagnostics -namespace true -theme default -type fpdialog
     dui page add ShotHistoryEditor_help -namespace true -theme default -type fpdialog
+    dui page add ShotHistoryEditor_reconcile -namespace true -theme default -type fpdialog
+    dui page add ShotHistoryEditor_empty_preview -namespace true -theme default -type fpdialog
+    dui page add ShotHistoryEditor_purge_confirm -namespace true -theme default -type fpdialog
+    dui page add ShotHistoryEditor_purge_result -namespace true -theme default -type fpdialog
     return ShotHistoryEditor_settings
 }
 
@@ -650,13 +729,19 @@ proc ::plugins::ShotHistoryEditor::_navigate_done {target} {
     if {$target ne "" && ![_is_transient_name $target]} {
         catch { set ok [dui page exists $target] }
     }
+    # v0.8.3: the close_dialog fallbacks used to be bare catches; a failed
+    # exit is now logged (CLAUDE.md: navigation errors must be visible).
     if {$ok} {
         if {[catch { uplevel #0 [list dui page load $target] } err]} {
-            catch { msg "ShotHistoryEditor: ERROR navigating to $target: $err" }
-            catch { dui page close_dialog }
+            msg -ERROR "ShotHistoryEditor: navigating to $target failed: $err"
+            if {[catch { dui page close_dialog } err2]} {
+                msg -ERROR "ShotHistoryEditor: close_dialog fallback failed: $err2"
+            }
         }
     } else {
-        catch { dui page close_dialog }
+        if {[catch { dui page close_dialog } err]} {
+            msg -ERROR "ShotHistoryEditor: close_dialog failed (no valid return page '$target'): $err"
+        }
     }
 }
 
@@ -1282,9 +1367,13 @@ proc ::plugins::ShotHistoryEditor::_append_restore_log {batch_id restored collis
 # even though SDB still has their rows untouched.
 proc ::plugins::ShotHistoryEditor::_deleted_filenames_dict {} {
     set d [dict create]
+    # v0.10.0: a manifest line that has been unhidden (reconcile manifest,
+    # keyed to that exact line) hides nothing any more.
+    set reconciled [_reconciled_keys_dict]
     foreach rec [_manifest_records] {
         set orig [dict get $rec orig]
         if {[string match "*.shot" $orig]} {
+            if {[dict exists $reconciled [_manifest_key $rec]]} { continue }
             dict set d [file rootname [file tail $orig]] 1
         }
     }
@@ -1293,6 +1382,250 @@ proc ::plugins::ShotHistoryEditor::_deleted_filenames_dict {} {
 
 proc ::plugins::ShotHistoryEditor::deleted_shot_count {} {
     return [dict size [_deleted_filenames_dict]]
+}
+
+# ---------------------------------------------------------------------------
+# v0.9.0 -- reconciliation view (READ-ONLY). A trash-manifest line hides its
+# shot from every list here for as long as the line stands. If the original
+# path is populated again meanwhile -- seen for real on 2026-08-24, when the
+# core's flush-save bug parked a corpse under a restored shot's name; also a
+# hand copy, or a restore whose manifest rewrite failed -- the shot is on
+# disk and SDB re-lists it on its next resync, yet this plugin neither shows
+# it nor lets you delete it, and Restore reports a collision for it. This
+# pass only SURFACES that state (Advanced > Reconcile hidden shots). The
+# action (un-hide, or forget the stale line) is a later, separately
+# authorized pass. Nothing below writes anything.
+# ---------------------------------------------------------------------------
+
+proc ::plugins::ShotHistoryEditor::_reconcile_records {} {
+    set out {}
+    set reconciled [_reconciled_keys_dict]
+    foreach rec [_manifest_records] {
+        set orig [dict get $rec orig]
+        if {![string match "*.shot" $orig]} { continue }
+        if {![file exists $orig]} { continue }
+        if {[dict exists $reconciled [_manifest_key $rec]]} { continue }
+        set trash [dict get $rec trash]
+        set trash_exists [file exists $trash]
+        set disk_mtime ""
+        set trash_mtime ""
+        catch { set disk_mtime [file mtime $orig] }
+        if {$trash_exists} { catch { set trash_mtime [file mtime $trash] } }
+        lappend out [dict create filename [file rootname [file tail $orig]] orig $orig \
+            trash $trash trash_exists $trash_exists ts [dict get $rec ts] \
+            batch [dict get $rec batch] disk_mtime $disk_mtime trash_mtime $trash_mtime]
+    }
+    return [lsort -command ::plugins::ShotHistoryEditor::_batch_ts_cmp -decreasing $out]
+}
+
+proc ::plugins::ShotHistoryEditor::reconcile_count {} {
+    return [llength [_reconcile_records]]
+}
+
+# SDB's view of a known list of filenames: "listed", "flagged removed", or
+# absent from the dict. One read-only SELECT on the same handle path every
+# other reader uses; filenames come from the manifest, never typed.
+proc ::plugins::ShotHistoryEditor::_sdb_presence {filenames} {
+    set presence [dict create]
+    if {[llength $filenames] == 0} { return $presence }
+    set db [_open_ro_db]
+    if {$db eq ""} { return $presence }
+    set table [_choose_source $db]
+    if {$table ne ""} {
+        set cols [_columns $db $table]
+        if {[_has_col $cols filename]} {
+            set removed_expr [expr {[_has_col $cols removed] ? [_q removed] : "NULL"}]
+            set in_list [join [lmap fn $filenames { _qval $fn }] ", "]
+            if {[catch {
+                $db eval "SELECT [_q filename] AS fn, $removed_expr AS rm FROM [_q $table] WHERE [_q filename] IN ($in_list)" row {
+                    set flagged [expr {[string is integer -strict $row(rm)] && $row(rm) != 0}]
+                    dict set presence $row(fn) [expr {$flagged ? "flagged removed" : "listed"}]
+                }
+            } err]} {
+                msg -NOTICE "ShotHistoryEditor: reconcile SDB lookup failed: $err"
+            }
+        }
+    }
+    _close_db
+    return $presence
+}
+
+proc ::plugins::ShotHistoryEditor::_fmt_mtime {t} {
+    if {$t eq ""} { return "unknown" }
+    return [_fmt_time $t]
+}
+
+# ---------------------------------------------------------------------------
+# v0.10.0 -- reconcile ACTION "Unhide" (the fifth authorized write
+# capability). Writes exactly two plugin-owned files and nothing else:
+#   - reconcile_manifest.txt: one appended line per unhide,
+#       unhidden_at|ts|orig|batch   (ts|orig|batch = the trash-manifest line)
+#   - delete_log.txt: one appended RECONCILE UNHIDE audit line.
+# The trash manifest is NEVER edited by this path (so a still-present trash
+# copy stays tracked and Restore keeps reporting its collision), no file is
+# moved, and history/ is not touched. The marker is keyed to the exact
+# manifest line, so deleting the same shot again later creates a new line
+# that hides it again; that re-delete is also the in-app undo.
+# ---------------------------------------------------------------------------
+
+proc ::plugins::ShotHistoryEditor::reconcile_manifest_path {} {
+    return [file join [_plugins_dir] ShotHistoryEditor reconcile_manifest.txt]
+}
+
+proc ::plugins::ShotHistoryEditor::_manifest_key {rec} {
+    return "[dict get $rec ts]|[dict get $rec orig]|[dict get $rec batch]"
+}
+
+# Keys (ts|orig|batch) of every trash-manifest line that has been unhidden.
+proc ::plugins::ShotHistoryEditor::_reconciled_keys_dict {} {
+    set d [dict create]
+    set path [reconcile_manifest_path]
+    if {![file isfile $path]} { return $d }
+    if {[catch {
+        set fh [open $path r]
+        fconfigure $fh -encoding utf-8
+        while {[gets $fh line] >= 0} {
+            set parts [split [string trim $line] "|"]
+            if {[llength $parts] != 4} { continue }
+            dict set d "[lindex $parts 1]|[lindex $parts 2]|[lindex $parts 3]" 1
+        }
+        close $fh
+    }]} {
+        catch { close $fh }
+    }
+    return $d
+}
+
+proc ::plugins::ShotHistoryEditor::_append_reconcile_log {now orig batch} {
+    catch {
+        set lh [open [delete_log_path] a]
+        fconfigure $lh -encoding utf-8
+        puts $lh "$now RECONCILE UNHIDE orig=$orig batch=$batch (trash entry kept, shot visible again)"
+        close $lh
+    }
+}
+
+# The one write of this capability. Refuses unless the manifest line still
+# exists, the file is really on disk, and it was not unhidden already.
+proc ::plugins::ShotHistoryEditor::perform_unhide {ts orig batch} {
+    set key "$ts|$orig|$batch"
+    set found 0
+    foreach rec [_manifest_records] {
+        if {[_manifest_key $rec] eq $key} { set found 1; break }
+    }
+    if {!$found} {
+        return [dict create ok 0 message "that trash entry is no longer in the manifest; nothing written."]
+    }
+    if {![file exists $orig]} {
+        return [dict create ok 0 message "[file tail $orig] is not on disk any more; nothing written."]
+    }
+    if {[dict exists [_reconciled_keys_dict] $key]} {
+        return [dict create ok 0 message "already unhidden."]
+    }
+    set now [clock format [clock seconds] -format {%Y%m%dT%H%M%S}]
+    if {[catch {
+        set fh [open [reconcile_manifest_path] a]
+        fconfigure $fh -encoding utf-8
+        puts $fh "$now|$ts|$orig|$batch"
+        close $fh
+    } err]} {
+        if {[info exists fh]} { catch { close $fh } }
+        return [dict create ok 0 message "could not write the reconcile manifest: $err"]
+    }
+    _append_reconcile_log $now $orig $batch
+    msg -INFO "ShotHistoryEditor: unhid $orig (trash entry $ts/$batch kept)"
+    return [dict create ok 1 message ""]
+}
+
+proc ::plugins::ShotHistoryEditor::scroll_reconcile {delta} {
+    variable reconcile_offset
+    variable reconcile_page_size
+    incr reconcile_offset [expr {$delta * $reconcile_page_size}]
+    if {$reconcile_offset < 0} { set reconcile_offset 0 }
+    refresh_reconcile_page ShotHistoryEditor_reconcile
+}
+
+proc ::plugins::ShotHistoryEditor::_reconcile_shown {} {
+    variable reconcile_offset
+    variable reconcile_page_size
+    set records [_reconcile_records]
+    set total [llength $records]
+    if {$total <= 0} {
+        set reconcile_offset 0
+    } else {
+        set max_offset [expr {(($total - 1) / $reconcile_page_size) * $reconcile_page_size}]
+        if {$reconcile_offset > $max_offset} { set reconcile_offset $max_offset }
+    }
+    if {$reconcile_offset < 0} { set reconcile_offset 0 }
+    return [list $total [lrange $records $reconcile_offset [expr {$reconcile_offset + $reconcile_page_size - 1}]]]
+}
+
+proc ::plugins::ShotHistoryEditor::refresh_reconcile_page {page} {
+    variable reconcile_offset
+    variable reconcile_page_size
+    variable reconcile_note
+
+    lassign [_reconcile_shown] total shown
+    # Status: always at most two lines (the header sits 3 caption lines below).
+    if {$total == 0} {
+        set status "No hidden shots exist on disk again."
+        set hint "Every shot the trash manifest hides is really absent from history/."
+    } else {
+        set status "Showing [expr {$reconcile_offset + 1}]-[expr {$reconcile_offset + [llength $shown]}] of $total hidden shot(s) that exist on disk again."
+        set hint "Unhide puts a shot back in the lists; its trash entry and any trash copy are kept."
+    }
+    append status "\n" [expr {$reconcile_note ne "" ? $reconcile_note : $hint}]
+    catch { dui item config $page reconcile_status -text $status }
+
+    set presence [_sdb_presence [lmap r $shown { dict get $r filename }]]
+    for {set i 0} {$i < $reconcile_page_size} {incr i} {
+        if {$i < [llength $shown]} {
+            set r [lindex $shown $i]
+            set fn [dict get $r filename]
+            set sdb "not in SDB"
+            if {[dict exists $presence $fn]} { set sdb [dict get $presence $fn] }
+            set ts [dict get $r ts]
+            set deleted_at $ts
+            catch { set deleted_at [clock format [clock scan $ts -format {%Y%m%dT%H%M%S}] -format "%Y/%m/%d %H:%M"] }
+            if {[dict get $r trash_exists]} {
+                set copy "trash copy present (two different files)"
+            } else {
+                set copy "trash copy missing (stale manifest line)"
+            }
+            set text "$fn  |  deleted $deleted_at, batch [dict get $r batch]\non disk, modified [_fmt_mtime [dict get $r disk_mtime]]  |  $copy\nSDB: $sdb"
+            catch { dui item config $page row${i}_text -text $text }
+            catch { dui item show $page row${i}_text }
+            catch { dui item show $page row${i}_unhide* -initial 1 }
+        } else {
+            catch { dui item config $page row${i}_text -text "" }
+            catch { dui item hide $page row${i}_text }
+            catch { dui item hide $page row${i}_unhide* -initial 1 }
+        }
+    }
+    if {$reconcile_offset > 0} {
+        catch { dui item show $page reconcile_prev_page* -initial 1 }
+    } else {
+        catch { dui item hide $page reconcile_prev_page* -initial 1 }
+    }
+    if {$reconcile_offset + [llength $shown] < $total} {
+        catch { dui item show $page reconcile_next_page* -initial 1 }
+    } else {
+        catch { dui item hide $page reconcile_next_page* -initial 1 }
+    }
+}
+
+proc ::plugins::ShotHistoryEditor::unhide_row {i} {
+    variable reconcile_note
+    lassign [_reconcile_shown] total shown
+    if {$i < 0 || $i >= [llength $shown]} { return }
+    set r [lindex $shown $i]
+    set result [perform_unhide [dict get $r ts] [dict get $r orig] [dict get $r batch]]
+    if {[dict get $result ok]} {
+        set reconcile_note "Unhidden [dict get $r filename]: back in the card list and Source Inspector; its trash entry is unchanged."
+    } else {
+        set reconcile_note "Not unhidden: [dict get $result message]"
+    }
+    refresh_reconcile_page ShotHistoryEditor_reconcile
 }
 
 # Groups manifest records by batch id for the Trash/Restore page. Returns a
@@ -1323,6 +1656,322 @@ proc ::plugins::ShotHistoryEditor::_trash_batches {} {
 
 proc ::plugins::ShotHistoryEditor::_batch_ts_cmp {a b} {
     return [string compare [dict get $a ts] [dict get $b ts]]
+}
+
+# ---------------------------------------------------------------------------
+# v0.11.0 -- "Empty trash" PREVIEW. The workspace rule is "never permanent
+# deletion" and the verify harness rejects any `file delete`; per the
+# destructive-feature process this pass ships the preview stage only: what a
+# future Empty trash would remove (batches, files, sizes, ages, totals), with
+# the statement that nothing is deleted. Read-only: walks the trash manifest
+# and `file size`; writes nothing. A real Empty trash needs the CLAUDE.md
+# rule and the harness audit changed first, in its own explicit pass.
+# ---------------------------------------------------------------------------
+
+proc ::plugins::ShotHistoryEditor::_fmt_bytes {n} {
+    if {$n >= 1048576} { return [format "%.1f MB" [expr {$n / 1048576.0}]] }
+    if {$n >= 1024} { return [format "%.1f KB" [expr {$n / 1024.0}]] }
+    return "$n B"
+}
+
+proc ::plugins::ShotHistoryEditor::empty_trash_preview_text {} {
+    set batches [_trash_batches]
+    set records [_manifest_records]
+    set now [clock seconds]
+    set lines [list \
+        "Empty trash removes every file in the plugin trash PERMANENTLY. Nothing is removed" \
+        "until you tap Empty trash (bottom right) and type the batch count on the confirmation" \
+        "page. Restore first anything you might still want; history/ is never touched." \
+        ""]
+    set empties [_empty_trash_dir_count]
+    if {[llength $batches] == 0} {
+        lappend lines "The trash is empty: no batches, no files."
+        if {$empties > 0} {
+            lappend lines "$empties empty batch folder(s) remain under the trash; Advanced > Tidy empty trash folders removes them."
+        }
+        return [join $lines "\n"]
+    }
+    set tot_bytes 0; set tot_files 0; set tot_shots 0; set tot_missing 0
+    foreach b $batches {
+        set bid [dict get $b batch_id]
+        set bytes 0; set present 0; set missing 0
+        foreach rec $records {
+            if {[dict get $rec batch] ne $bid} { continue }
+            set t [dict get $rec trash]
+            if {[file isfile $t]} {
+                incr present
+                catch { incr bytes [file size $t] }
+            } else {
+                incr missing
+            }
+        }
+        set ts [dict get $b ts]
+        set when $ts
+        set age "?"
+        catch {
+            set secs [clock scan $ts -format {%Y%m%dT%H%M%S}]
+            set when [clock format $secs -format "%Y/%m/%d %H:%M"]
+            set age [expr {($now - $secs) / 86400}]
+        }
+        set fc [dict get $b file_count]
+        set files_note [expr {$missing ? "$present of $fc files present" : "all $fc files present"}]
+        lappend lines "$when  |  batch $bid  |  [dict get $b shot_count] shot(s)  |  $files_note  |  [_fmt_bytes $bytes]  |  $age day(s) old"
+        incr tot_bytes $bytes
+        incr tot_files $present
+        incr tot_shots [dict get $b shot_count]
+        incr tot_missing $missing
+    }
+    lappend lines ""
+    lappend lines "Would be removed permanently: [llength $batches] batch(es), $tot_shots shot(s), $tot_files file(s), [_fmt_bytes $tot_bytes] under [trash_dir]"
+    if {$tot_missing > 0} {
+        lappend lines "$tot_missing manifest entr(y/ies) point at files that are already gone (restored, or moved by hand)."
+    }
+    if {$empties > 0} {
+        lappend lines "$empties empty batch folder(s) under the trash (left by earlier restores) would go too; Advanced > Tidy removes them on their own."
+    }
+    lappend lines "The trash manifest and delete log would be kept as the audit trail."
+    return [join $lines "\n"]
+}
+
+# ---------------------------------------------------------------------------
+# v0.12.0 -- real Empty trash (the sixth authorized write capability; the
+# first permanent deletion, under the CLAUDE.md exception of 2026-09-18).
+# The whole write path, in order:
+#   1. open_purge_confirm snapshots the batch ids; confirm_purge_submit
+#      requires the typed batch count.
+#   2. perform_purge refuses if the batch set changed since the snapshot.
+#   3. For every trash-manifest line: the trash path must resolve STRICTLY
+#      inside plugins/ShotHistoryEditor/trash/ (else kept + logged), must be
+#      a listed file (else "already gone", line dropped); then ONE
+#      `file delete` on that file. Then `file delete` on each batch folder
+#      only if it is now empty (non-empty folders stay).
+#   4. Every file gets a line in purge_log.txt (append-only); the trash
+#      manifest is rewritten without the removed lines; delete_log.txt gets
+#      one PURGE summary line.
+# history/, history_v2/ and SDB are never touched by this path.
+# ---------------------------------------------------------------------------
+
+proc ::plugins::ShotHistoryEditor::purge_log_path {} {
+    return [file join [_plugins_dir] ShotHistoryEditor purge_log.txt]
+}
+
+# True only for a path strictly inside the plugin's own trash folder.
+proc ::plugins::ShotHistoryEditor::_inside_trash_dir {path} {
+    if {$path eq ""} { return 0 }
+    set prefix "[file normalize [trash_dir]]/"
+    set p [file normalize $path]
+    return [expr {[string length $p] > [string length $prefix] &&
+                  [string equal -length [string length $prefix] $prefix $p]}]
+}
+
+proc ::plugins::ShotHistoryEditor::_append_purge_line {ts rec bytes status} {
+    catch {
+        set fh [open [purge_log_path] a]
+        fconfigure $fh -encoding utf-8
+        puts $fh "$ts|[dict get $rec batch]|[dict get $rec orig]|[dict get $rec trash]|$bytes|$status"
+        close $fh
+    }
+}
+
+proc ::plugins::ShotHistoryEditor::perform_purge {expected_batch_ids} {
+    set ts [clock format [clock seconds] -format {%Y%m%dT%H%M%S}]
+    set batches [_trash_batches]
+    set ids [lsort [lmap b $batches { dict get $b batch_id }]]
+    if {$ids ne [lsort $expected_batch_ids]} {
+        return [dict create ok 0 message "The trash changed since the preview; nothing was removed. Open the preview again." \
+            batches 0 removed_files 0 bytes 0 skipped {} already_gone 0 manifest_ok 1]
+    }
+    if {[llength $batches] == 0} {
+        return [dict create ok 0 message "The trash is empty; nothing to remove." \
+            batches 0 removed_files 0 bytes 0 skipped {} already_gone 0 manifest_ok 1]
+    }
+    set removed 0
+    set bytes 0
+    set already_gone 0
+    set skipped {}
+    set keep {}
+    foreach rec [_manifest_records] {
+        set t [dict get $rec trash]
+        if {![_inside_trash_dir $t]} {
+            lappend skipped [dict create path $t reason "outside the plugin trash folder"]
+            lappend keep $rec
+            _append_purge_line $ts $rec 0 "SKIPPED outside trash"
+            continue
+        }
+        if {![file isfile $t]} {
+            incr already_gone
+            _append_purge_line $ts $rec 0 "already gone"
+            continue
+        }
+        set sz 0
+        catch { set sz [file size $t] }
+        if {[catch { file delete -- $t } err]} {   ;# purge-only (CLAUDE.md exception 2026-09-18)
+            lappend skipped [dict create path $t reason "could not remove: $err"]
+            lappend keep $rec
+            _append_purge_line $ts $rec $sz "FAILED $err"
+            continue
+        }
+        incr removed
+        incr bytes $sz
+        _append_purge_line $ts $rec $sz "removed"
+    }
+    # v0.13.0: every empty folder directly under the trash goes, not only
+    # the ones this purge emptied (earlier restores left theirs behind).
+    set folders_removed [_remove_empty_trash_dirs]
+    set manifest_ok [_rewrite_manifest $keep]
+    catch {
+        set lh [open [delete_log_path] a]
+        fconfigure $lh -encoding utf-8
+        puts $lh "$ts PURGE batches=[llength $batches] files_removed=$removed bytes=$bytes folders_removed=$folders_removed already_gone=$already_gone skipped=[llength $skipped] manifest_rewritten=$manifest_ok (Empty trash)"
+        close $lh
+    }
+    msg -NOTICE "ShotHistoryEditor: Empty trash removed $removed file(s), $bytes bytes, [llength $batches] batch(es), $folders_removed empty folder(s); skipped [llength $skipped]"
+    return [dict create ok 1 message "" batches [llength $batches] removed_files $removed bytes $bytes \
+        skipped $skipped already_gone $already_gone manifest_ok $manifest_ok folders_removed $folders_removed]
+}
+
+# ---------------------------------------------------------------------------
+# v0.13.0 -- empty trash folders. Restore moves files out of a batch folder
+# but never removed the folder, so the tablet had 14 empty ones. This sweep
+# removes every EMPTY folder directly under the plugin trash (the ONLY folder
+# `file delete` in the plugin, guarded by _inside_trash_dir; a folder holding
+# anything at all stays). Shared by Empty trash and Advanced > Tidy.
+# ---------------------------------------------------------------------------
+
+proc ::plugins::ShotHistoryEditor::_empty_trash_dirs {} {
+    set root [trash_dir]
+    if {![file isdirectory $root]} { return {} }
+    set out {}
+    foreach d [lsort [glob -nocomplain -directory $root -types d *]] {
+        if {![_inside_trash_dir $d]} { continue }
+        set left [lsearch -all -inline -not -regexp [glob -nocomplain -directory $d -tails * .*] {^\.\.?$}]
+        if {[llength $left] == 0} { lappend out $d }
+    }
+    return $out
+}
+
+proc ::plugins::ShotHistoryEditor::_empty_trash_dir_count {} {
+    return [llength [_empty_trash_dirs]]
+}
+
+proc ::plugins::ShotHistoryEditor::_remove_empty_trash_dirs {} {
+    set removed 0
+    foreach d [_empty_trash_dirs] {
+        if {[catch { file delete -- $d } err]} {   ;# purge-only (CLAUDE.md exception 2026-09-18)
+            msg -NOTICE "ShotHistoryEditor: could not remove the empty trash folder $d: $err"
+        } else {
+            incr removed
+        }
+    }
+    return $removed
+}
+
+# Advanced > Tidy: folders only, files and batches untouched; one audit line.
+proc ::plugins::ShotHistoryEditor::tidy_trash_folders {} {
+    variable tidy_note
+    set n [_remove_empty_trash_dirs]
+    set ts [clock format [clock seconds] -format {%Y%m%dT%H%M%S}]
+    catch {
+        set lh [open [delete_log_path] a]
+        fconfigure $lh -encoding utf-8
+        puts $lh "$ts TIDY removed $n empty trash folder(s)"
+        close $lh
+    }
+    msg -INFO "ShotHistoryEditor: Tidy removed $n empty trash folder(s)"
+    set tidy_note "Tidy: removed $n empty trash folder(s); files and batches untouched."
+    refresh_advanced_page ShotHistoryEditor_advanced
+}
+
+proc ::plugins::ShotHistoryEditor::refresh_advanced_page {page} {
+    variable tidy_note
+    set n [deleted_shot_count]
+    set r [reconcile_count]
+    set note ""
+    if {$n > 0} {
+        set note "$n deleted shot(s) hidden (SDB not modified; it may resync on its own)."
+    }
+    if {$r > 0} {
+        append note [expr {$note eq "" ? "" : " "}] "$r of them exist on disk again - see Reconcile hidden shots."
+    }
+    if {$tidy_note ne ""} {
+        append note [expr {$note eq "" ? "" : "\n"}] $tidy_note
+    }
+    catch { dui item config $page deleted_note -text $note }
+}
+
+proc ::plugins::ShotHistoryEditor::open_purge_confirm {} {
+    variable purge_batch_ids
+    variable purge_input
+    variable purge_error
+    set purge_batch_ids [lmap b [_trash_batches] { dict get $b batch_id }]
+    if {[llength $purge_batch_ids] == 0} { return }
+    set purge_input ""
+    set purge_error ""
+    open_page ShotHistoryEditor_purge_confirm
+}
+
+proc ::plugins::ShotHistoryEditor::cancel_purge_confirm {} {
+    _return_to_page ShotHistoryEditor_empty_preview
+}
+
+proc ::plugins::ShotHistoryEditor::refresh_purge_confirm_page {page} {
+    variable purge_batch_ids
+    variable purge_error
+    set n [llength $purge_batch_ids]
+    catch { dui item config $page purge_instructions -text \
+        "Type $n (the number of trash batches) below, then tap Remove permanently. Every file in the plugin trash is deleted for good; this cannot be undone. history/ is not touched." }
+    catch { dui item config $page purge_error_text -text $purge_error }
+}
+
+# The one place that calls perform_purge.
+proc ::plugins::ShotHistoryEditor::confirm_purge_submit {} {
+    variable purge_batch_ids
+    variable purge_input
+    variable purge_error
+    variable purge_result_text
+    set n [llength $purge_batch_ids]
+    set typed [string trim $purge_input]
+    if {$n == 0 || $typed ne [expr {$n}]} {
+        set purge_error "Type exactly \"$n\" to confirm. Nothing was removed."
+        refresh_purge_confirm_page ShotHistoryEditor_purge_confirm
+        return
+    }
+    set result [perform_purge $purge_batch_ids]
+    set lines [list]
+    if {[dict get $result ok]} {
+        lappend lines "Removed [dict get $result removed_files] file(s) ([_fmt_bytes [dict get $result bytes]]) from [dict get $result batches] trash batch(es), permanently."
+        if {[dict get $result already_gone] > 0} {
+            lappend lines "[dict get $result already_gone] manifest entr(y/ies) pointed at files that were already gone."
+        }
+        if {[dict get $result folders_removed] > 0} {
+            lappend lines "Removed [dict get $result folders_removed] empty batch folder(s)."
+        }
+        if {![dict get $result manifest_ok]} {
+            lappend lines "WARNING: the trash manifest could not be rewritten; see the log."
+        }
+    } else {
+        lappend lines "Not removed: [dict get $result message]"
+    }
+    set skipped [dict get $result skipped]
+    if {[llength $skipped] > 0} {
+        lappend lines ""
+        lappend lines "Kept (not removed):"
+        foreach s $skipped { lappend lines "  [dict get $s path]: [dict get $s reason]" }
+    }
+    lappend lines ""
+    lappend lines "Audit: purge_log.txt (one line per file) and delete_log.txt. history/ and SDB were not touched."
+    set purge_result_text [join $lines "\n"]
+    open_page ShotHistoryEditor_purge_result
+}
+
+proc ::plugins::ShotHistoryEditor::refresh_purge_result_page {page} {
+    variable purge_result_text
+    catch { dui item config $page purge_result_text -text $purge_result_text }
+}
+
+# Back to the Trash page, whose show{} refreshes the (now emptier) list.
+proc ::plugins::ShotHistoryEditor::close_purge_result {} {
+    _return_to_page ShotHistoryEditor_trash
 }
 
 # Moves history/<filename>.shot and (if present) history_v2/<filename>.json
@@ -1473,9 +2122,20 @@ proc ::plugins::ShotHistoryEditor::restore_batch {batch_id} {
     return [dict create restored $restored collisions $collisions refresh_note $note]
 }
 
+# v0.8.2: idempotent. Every reader closes the handle when done and
+# _open_ro_db closes it again before opening, so the old bare
+# `catch { $db_handle close }` failed on every open; catch swallowed the
+# error but left $::errorInfo dirty, and the core BLE runner prints
+# $::errorInfo (de1_comms.tcl:120) -- surfaced as "BLE error info invalid
+# command name ..." (first seen in MaintenanceTracker v0.21.2). Closing
+# only an existing command raises nothing.
 proc ::plugins::ShotHistoryEditor::_close_db {} {
     variable db_handle
-    catch { $db_handle close }
+    if {[llength [info commands $db_handle]]} {
+        if {[catch { $db_handle close } err]} {
+            catch { msg "ShotHistoryEditor: SDB close failed: $err" }
+        }
+    }
 }
 
 proc ::plugins::ShotHistoryEditor::_open_ro_db {} {
@@ -1641,6 +2301,11 @@ proc ::plugins::ShotHistoryEditor::scroll_page {kind delta dui_page} {
             variable delete_review_page_index
             incr delete_review_page_index $delta
             _set_paged_text $dui_page review_text review_page_status [build_delete_review_text] delete_review_page_index
+        }
+        empty_preview {
+            variable empty_preview_page_index
+            incr empty_preview_page_index $delta
+            _set_paged_text $dui_page empty_preview_text empty_preview_page_status [empty_trash_preview_text] empty_preview_page_index
         }
     }
 }
@@ -2291,6 +2956,8 @@ proc ::plugins::ShotHistoryEditor::diagnostics_text {} {
         "Trash manifest path: [trash_manifest_path]" \
         "Delete log path: [delete_log_path]" \
         "$deleted_n deleted shot(s) hidden (SDB not modified; it may resync on its own)." \
+        "Hidden shots that exist on disk again: [reconcile_count] (Advanced > Reconcile hidden shots)" \
+        "Reconcile manifest path: [reconcile_manifest_path]" \
         "Backups folder path: [backups_dir]" \
         "Edit manifest path: [edit_manifest_path]" \
         "Edit log path: [edit_log_path]" \
@@ -2304,16 +2971,17 @@ proc ::plugins::ShotHistoryEditor::help_text {} {
         "The legacy history/*.shot settings block is the durable, real source for editable metadata." \
         "history_v2 is read-only for comparison; edits and deletes never write to it (see below)." \
         "" \
-        "Real metadata save (new in v0.5.0): Edit Metadata Preview lets you choose one safe field, type a new value, and Preview Change (still just a preview). Tapping Save Change opens a Before/After confirmation; tapping the danger-colored Save Change button there writes ONLY that one field into history/<filename>.shot's settings block -- every other byte of the file, including the raw sensor arrays, is left untouched. A backup of the whole file is made first (plugins/ShotHistoryEditor/backups/), the write is verified before AND after it replaces the original, and a failed save automatically restores the backup. SDB is never written to and history_v2 is never touched by a save, so the card list and Detail page overlay your correction from an edit manifest until SDB resyncs on its own." \
+        "Real metadata save (v0.5.0): pick one safe field, type a value, Preview Change, then Save Change and confirm. Only that one settings line of history/<filename>.shot is rewritten, after a whole-file backup (plugins/ShotHistoryEditor/backups/) and verified before and after; a failed save restores the backup. SDB and history_v2 are never written." \
         "" \
         "Safe editable fields:" \
         "grinder_setting, grinder_dose_weight, drink_weight, bean_brand, bean_type, espresso_notes, my_name, drinker_name." \
         "" \
         "Soft delete (v0.4.0): selecting shots and tapping Delete opens a two-step confirmation (Review, then a typed Confirm). Confirming MOVES history/<filename>.shot and, if present, history_v2/<filename>.json into plugins/ShotHistoryEditor/trash/ -- files are only ever moved, never deleted, and never edited. SDB itself is never written to, so deleted shots are hidden by filtering the list against a manifest file, not by changing SDB." \
         "Advanced > Trash / Restore lists every deleted batch and can move its files back to their original location." \
-        "There is no \"Empty trash\" button in this version -- permanent deletion does not exist yet." \
+        "Empty trash (Trash page) permanently removes the plugin trash's files after a typed confirmation; history/ is never touched." \
         "" \
         "Raw pressure, flow, temperature, resistance, shot_series, chart arrays, and machine sensor data are off-limits -- never displayed for editing, never modified." \
+        "Reconcile hidden shots (Advanced, v0.10.0): shots the trash manifest still hides although their file is back in history/. Unhide appends one marker line to reconcile_manifest.txt (plus an audit line); the trash entry is never edited." \
         "" \
         "Rinse, flush, steam, hot water, and cleaning shots never trigger anything in this plugin -- it has no automatic hooks at all."] "\n"]
 }
@@ -2329,6 +2997,7 @@ proc ::plugins::ShotHistoryEditor::select_recent_row {idx} {
 proc ::plugins::ShotHistoryEditor::refresh_recent_page {page} {
     variable recent_rows
     variable last_error
+    variable max_recent
     load_recent_shots
 
     if {[llength $recent_rows] == 0} {
@@ -2339,16 +3008,19 @@ proc ::plugins::ShotHistoryEditor::refresh_recent_page {page} {
     }
     catch { dui item config $page recent_status -text $status }
 
-    for {set i 0} {$i < 8} {incr i} {
+    for {set i 0} {$i < $max_recent} {incr i} {
         if {$i < [llength $recent_rows]} {
             set row [lindex $recent_rows $i]
             set bean [_bean_label [_dget $row bean_brand] [_dget $row bean_type]]
             set text "[_fmt_time [_dget $row clock]] | [_display [_dget $row filename]] | grind [_display [_dget $row grinder_setting]] | dose [_display [_dget $row grinder_dose_weight]] | yield [_display [_dget $row drink_weight]] | $bean | time [_display [_dget $row extraction_time]]"
             catch { dui item config $page row${i}_text -text $text }
-            catch { dui item show $page row${i}_open* }
+            catch { dui item show $page row${i}_open* -initial 1 }
         } else {
             catch { dui item config $page row${i}_text -text "" }
-            catch { dui item hide $page row${i}_open* }
+            # v0.8.3: -initial 1, the same form the card list and Trash page
+            # use since v0.8.1, so a hidden Open cannot flash back on the
+            # framework's pre-show{} re-show.
+            catch { dui item hide $page row${i}_open* -initial 1 }
         }
     }
 }
@@ -2808,6 +3480,16 @@ proc ::plugins::ShotHistoryEditor::refresh_trash_page {page} {
 
     set batches [_trash_batches]
     set total [llength $batches]
+    # v0.9.1: clamp the offset to the last real page (same rule as the card
+    # list since v0.8.1), so Next can never walk past the end and a restore
+    # that empties the last page snaps back instead of showing nothing.
+    if {$total <= 0} {
+        set trash_offset 0
+    } else {
+        set max_offset [expr {(($total - 1) / $trash_page_size) * $trash_page_size}]
+        if {$trash_offset > $max_offset} { set trash_offset $max_offset }
+    }
+    if {$trash_offset < 0} { set trash_offset 0 }
     set shown [lrange $batches $trash_offset [expr {$trash_offset + $trash_page_size - 1}]]
 
     if {$total == 0} {
@@ -2843,6 +3525,14 @@ proc ::plugins::ShotHistoryEditor::refresh_trash_page {page} {
         catch { dui item show $page trash_prev_page* -initial 1 }
     } else {
         catch { dui item hide $page trash_prev_page* -initial 1 }
+    }
+    # v0.9.1: Next, hidden on the last page and on an empty list. Before
+    # this the page had no Next at all, so with more than trash_page_size
+    # batches the older ones were unreachable (tablet: "Showing 1-6 of 7").
+    if {$trash_offset + [llength $shown] < $total} {
+        catch { dui item show $page trash_next_page* -initial 1 }
+    } else {
+        catch { dui item hide $page trash_next_page* -initial 1 }
     }
 }
 
@@ -2926,9 +3616,14 @@ proc ::plugins::ShotHistoryEditor::refresh_main_page {page} {
             catch { dui item show $page row${i}_btn* -initial 1 }
 
             if {$select_mode} {
-                catch { dui item config $page row${i}_btn -label [translate [expr {[_is_selected $filename] ? "☑ Selected" : "☐ Select"}]] }
+                if {[_is_selected $filename]} {
+                    set lbl "[::plugins::ShotHistoryEditor::_u 0x2611] Selected"
+                } else {
+                    set lbl "[::plugins::ShotHistoryEditor::_u 0x2610] Select"
+                }
+                catch { dui item config $page row${i}_btn -label [translate $lbl] }
             } else {
-                catch { dui item config $page row${i}_btn -label [translate "✎ Edit"] }
+                catch { dui item config $page row${i}_btn -label [translate "[::plugins::ShotHistoryEditor::_u 0x270e] Edit"] }
             }
         } else {
             catch { dui item hide $page row${i}_bg -initial 1 }
@@ -3023,10 +3718,10 @@ namespace eval ::dui::pages::ShotHistoryEditor_settings {
         set next_x1 [expr {$rx - $L(btn_w_std)}]
         set prev_x1 [expr {$next_x1 - $L(sm) - $L(btn_w_std)}]
         dui add dbutton $page $prev_x1 $L(toolbar_y0) [expr {$prev_x1+$L(btn_w_std)}] $L(toolbar_y1) \
-            -tags prev_page -label [translate "◀ Prev"] -command {::plugins::ShotHistoryEditor::scroll_cards -1} \
+            -tags prev_page -label [translate "[::plugins::ShotHistoryEditor::_u 0x25c0] Prev"] -command {::plugins::ShotHistoryEditor::scroll_cards -1} \
             -label_font $L(font_button) -style she_btn
         dui add dbutton $page $next_x1 $L(toolbar_y0) $rx $L(toolbar_y1) \
-            -tags next_page -label [translate "Next ▶"] -command {::plugins::ShotHistoryEditor::scroll_cards 1} \
+            -tags next_page -label [translate "Next [::plugins::ShotHistoryEditor::_u 0x25b6]"] -command {::plugins::ShotHistoryEditor::scroll_cards 1} \
             -label_font $L(font_button) -style she_btn
 
         # Card list: exactly one background + 3 text lines + 1 action button per row.
@@ -3052,7 +3747,7 @@ namespace eval ::dui::pages::ShotHistoryEditor_settings {
             set btn_y1 [expr {$top + int(($L(card_h)-$L(card_btn_h))/2)}]
             set btn_y2 [expr {$btn_y1 + $L(card_btn_h)}]
             dui add dbutton $page $btn_x1 $btn_y1 $btn_x2 $btn_y2 -tags row${i}_btn \
-                -label [translate "✎ Edit"] -command "::plugins::ShotHistoryEditor::card_btn_click $i" \
+                -label [translate "[::plugins::ShotHistoryEditor::_u 0x270e] Edit"] -command "::plugins::ShotHistoryEditor::card_btn_click $i" \
                 -label_font $L(font_button) -style she_btn
         }
 
@@ -3090,7 +3785,7 @@ namespace eval ::dui::pages::ShotHistoryEditor_advanced {
         dui add dtext $page $cx $L(header_title_y) -tags page_title -text [translate "Advanced / Source Inspector"] \
             -font $L(font_section) -width $L(content_w) -fill $L(text_body) -anchor center -justify center
         dui add dtext $page $cx $L(header_subtitle_y) -tags subtitle \
-            -text [translate "Optional read-only tools. Not required for normal use."] \
+            -text [translate "Optional tools. Not required for normal use."] \
             -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor center -justify center
         dui add dtext $page $lx $L(toolbar_y0) -tags deleted_note -text "" \
             -font $L(font_caption) -width $L(content_w) -fill $L(warn) -anchor nw -justify left
@@ -3111,6 +3806,16 @@ namespace eval ::dui::pages::ShotHistoryEditor_advanced {
         dui add dbutton $page $lx $y $rx [expr {$y+$L(btn_h)}] -tags trash_restore \
             -label [translate "Trash / Restore"] -command {::plugins::ShotHistoryEditor::open_page ShotHistoryEditor_trash} \
             -label_font $L(font_button) -style she_btn
+        incr y [expr {$L(btn_h)+$L(md)}]
+        # v0.9.0: read-only reconciliation view (see _reconcile_records).
+        dui add dbutton $page $lx $y $rx [expr {$y+$L(btn_h)}] -tags reconcile \
+            -label [translate "Reconcile hidden shots"] -command {::plugins::ShotHistoryEditor::open_page ShotHistoryEditor_reconcile} \
+            -label_font $L(font_button) -style she_btn
+        incr y [expr {$L(btn_h)+$L(md)}]
+        # v0.13.0: removes only EMPTY folders directly under the plugin trash.
+        dui add dbutton $page $lx $y $rx [expr {$y+$L(btn_h)}] -tags tidy \
+            -label [translate "Tidy empty trash folders"] -command ::plugins::ShotHistoryEditor::tidy_trash_folders \
+            -label_font $L(font_button) -style she_btn
 
         # v0.4.1 bugfix: was open_page (open_dialog on an ancestor already in
         # the stack, same fault class as the delete-flow exits -- see
@@ -3122,13 +3827,10 @@ namespace eval ::dui::pages::ShotHistoryEditor_advanced {
     }
 
     proc show {page_to_hide page_to_show} {
-        set n [::plugins::ShotHistoryEditor::deleted_shot_count]
-        if {$n > 0} {
-            set note "$n deleted shot(s) hidden (SDB not modified; it may resync on its own)."
-        } else {
-            set note ""
-        }
-        catch { dui item config $page_to_show deleted_note -text $note }
+        # v0.13.0: the note is built by refresh_advanced_page (also called
+        # after Tidy); a Tidy result shows only until the page is next shown.
+        set ::plugins::ShotHistoryEditor::tidy_note ""
+        ::plugins::ShotHistoryEditor::refresh_advanced_page $page_to_show
     }
 }
 
@@ -3323,17 +4025,23 @@ namespace eval ::dui::pages::ShotHistoryEditor_trash {
             -font $L(font_caption) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
 
         set n_rows $::plugins::ShotHistoryEditor::trash_page_size
-        set list_start [expr {$header_y+$L(md)}]
+        set list_start [expr {$header_y+$L(caption_h)+$L(md)}]
         set list_end [expr {$L(bar_y0)-$L(md)}]
         set row_h [expr {double($list_end-$list_start)/$n_rows}]
-        set y $list_start
+        # v0.8.5: each row is a band of row_h; the text line and the button
+        # are both centred in it, and the button takes the design-system
+        # height (btn_h, the 60 px touch minimum) when the band allows, else
+        # the band minus sm. Was a fixed 0.7 x btn_h = 42 physical px.
+        set row_btn_h [expr {min($L(btn_h), $row_h - $L(sm))}]
         for {set i 0} {$i < $n_rows} {incr i} {
-            dui add dtext $page $lx $y -tags row${i}_text -text "" \
+            set band_top [expr {$list_start + $i*$row_h}]
+            set ty [expr {$band_top + ($row_h - $L(caption_h))/2.0}]
+            set by0 [expr {$band_top + ($row_h - $row_btn_h)/2.0}]
+            dui add dtext $page $lx $ty -tags row${i}_text -text "" \
                 -font $L(font_caption) -width $text_w -fill $L(text_body) -anchor nw -justify left
-            dui add dbutton $page [expr {$rx-$restore_w}] [expr {$y-$L(xs)}] $rx [expr {$y-$L(xs)+$L(btn_h)*0.7}] \
+            dui add dbutton $page [expr {$rx-$restore_w}] $by0 $rx [expr {$by0+$row_btn_h}] \
                 -tags row${i}_restore -label [translate "Restore"] \
                 -command "::plugins::ShotHistoryEditor::restore_row $i" -label_font $L(font_button) -style she_btn
-            set y [expr {$y+$row_h}]
         }
 
         # v0.6.2: Done leads the row from the far left; Back and the pager
@@ -3345,11 +4053,20 @@ namespace eval ::dui::pages::ShotHistoryEditor_trash {
             -label_font $L(font_button) -style she_btn
         incr x [expr {$bw+$L(sm)}]
         dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags back \
-            -label [translate "Back"] -command {::plugins::ShotHistoryEditor::open_page ShotHistoryEditor_advanced} \
+            -label [translate "Back"] -command {::plugins::ShotHistoryEditor::_return_to_page ShotHistoryEditor_advanced} \
             -label_font $L(font_button) -style she_btn
         incr x [expr {$bw+$L(sm)}]
         dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags trash_prev_page \
-            -label [translate "◀ Prev"] -command {::plugins::ShotHistoryEditor::scroll_trash -1} \
+            -label [translate "[::plugins::ShotHistoryEditor::_u 0x25c0] Prev"] -command {::plugins::ShotHistoryEditor::scroll_trash -1} \
+            -label_font $L(font_button) -style she_btn
+        # v0.9.1: Next beside Prev (was missing; see refresh_trash_page).
+        incr x [expr {$bw+$L(sm)}]
+        dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags trash_next_page \
+            -label [translate "Next [::plugins::ShotHistoryEditor::_u 0x25b6]"] -command {::plugins::ShotHistoryEditor::scroll_trash 1} \
+            -label_font $L(font_button) -style she_btn
+        # v0.11.0: far right, opens the Empty trash PREVIEW page (read-only).
+        dui add dbutton $page [expr {$rx-$bw}] $L(bar_y0) $rx $L(bar_y1) -tags empty_preview \
+            -label [translate "Empty trash..."] -command {::plugins::ShotHistoryEditor::open_page ShotHistoryEditor_empty_preview} \
             -label_font $L(font_button) -style she_btn
     }
 
@@ -3389,18 +4106,24 @@ namespace eval ::dui::pages::ShotHistoryEditor_recent {
         # so row_h is derived from the actual available space (not a fixed
         # fraction of card_h) -- a fixed 0.68*card_h row height overflowed
         # past bar_y0 on an 8-row list at the reference resolution.
-        set n_rows 8
-        set list_start [expr {$header_y+$L(md)}]
+        # v0.8.6: the row count IS max_recent (7), so the list, the refresh
+        # loop and the query always agree; with 7 rows the band is ~143
+        # virtual and the button reaches the full btn_h (60 physical px).
+        set n_rows $::plugins::ShotHistoryEditor::max_recent
+        set list_start [expr {$header_y+$L(caption_h)+$L(md)}]
         set list_end [expr {$L(bar_y0)-$L(md)}]
         set row_h [expr {double($list_end-$list_start)/$n_rows}]
-        set y $list_start
+        # v0.8.5: centred bands, same as the Trash page.
+        set row_btn_h [expr {min($L(btn_h), $row_h - $L(sm))}]
         for {set i 0} {$i < $n_rows} {incr i} {
-            dui add dtext $page $lx $y -tags row${i}_text -text "" \
+            set band_top [expr {$list_start + $i*$row_h}]
+            set ty [expr {$band_top + ($row_h - $L(caption_h))/2.0}]
+            set by0 [expr {$band_top + ($row_h - $row_btn_h)/2.0}]
+            dui add dtext $page $lx $ty -tags row${i}_text -text "" \
                 -font $L(font_caption) -width $text_w -fill $L(text_body) -anchor nw -justify left
-            dui add dbutton $page [expr {$rx-$open_w}] [expr {$y-$L(xs)}] $rx [expr {$y-$L(xs)+$L(btn_h)*0.7}] \
+            dui add dbutton $page [expr {$rx-$open_w}] $by0 $rx [expr {$by0+$row_btn_h}] \
                 -tags row${i}_open -label [translate "Open"] \
                 -command "::plugins::ShotHistoryEditor::select_recent_row $i" -label_font $L(font_button) -style she_btn
-            set y [expr {$y+$row_h}]
         }
 
         # v0.6.2: Done at the far left, Back beside it.
@@ -3410,7 +4133,7 @@ namespace eval ::dui::pages::ShotHistoryEditor_recent {
             -label_font $L(font_button) -style she_btn
         set back_x [expr {$lx+$bw+$L(sm)}]
         dui add dbutton $page $back_x $L(bar_y0) [expr {$back_x+$bw}] $L(bar_y1) -tags back \
-            -label [translate "Back"] -command {::plugins::ShotHistoryEditor::open_page ShotHistoryEditor_advanced} \
+            -label [translate "Back"] -command {::plugins::ShotHistoryEditor::_return_to_page ShotHistoryEditor_advanced} \
             -label_font $L(font_button) -style she_btn
     }
 
@@ -3450,7 +4173,7 @@ namespace eval ::dui::pages::ShotHistoryEditor_detail {
             -label_font $L(font_button) -style she_btn
         incr x [expr {$bw+$L(sm)}]
         dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags back \
-            -label [translate "Back"] -command {::plugins::ShotHistoryEditor::open_page ShotHistoryEditor_recent} \
+            -label [translate "Back"] -command {::plugins::ShotHistoryEditor::_return_to_page ShotHistoryEditor_recent} \
             -label_font $L(font_button) -style she_btn
         incr x [expr {$bw+$L(sm)}]
         dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags prev_page \
@@ -3587,7 +4310,7 @@ namespace eval ::dui::pages::ShotHistoryEditor_diagnostics {
         set bw $L(btn_w_std)
         set x [expr {$lx+$bw+$L(sm)}]
         dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags back \
-            -label [translate "Back"] -command {::plugins::ShotHistoryEditor::open_page ShotHistoryEditor_advanced} \
+            -label [translate "Back"] -command {::plugins::ShotHistoryEditor::_return_to_page ShotHistoryEditor_advanced} \
             -label_font $L(font_button) -style she_btn
         incr x [expr {$bw+$L(sm)}]
         dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags prev_page \
@@ -3637,7 +4360,7 @@ namespace eval ::dui::pages::ShotHistoryEditor_help {
         set bw $L(btn_w_std)
         set x [expr {$lx+$bw+$L(sm)}]
         dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags back \
-            -label [translate "Back"] -command {::plugins::ShotHistoryEditor::open_page ShotHistoryEditor_advanced} \
+            -label [translate "Back"] -command {::plugins::ShotHistoryEditor::_return_to_page ShotHistoryEditor_advanced} \
             -label_font $L(font_button) -style she_btn
         incr x [expr {$bw+$L(sm)}]
         dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags prev_page \
@@ -3663,5 +4386,190 @@ namespace eval ::dui::pages::ShotHistoryEditor_help {
     # v0.5.3: routed through _return_to_page like every other internal return.
     proc page_done {} {
         ::plugins::ShotHistoryEditor::_return_to_page ShotHistoryEditor_advanced
+    }
+}
+
+# v0.9.0: reconciliation view. v0.10.0: a row list with an Unhide button per
+# row and the Trash-style pager (was paged text). Rows are centred bands of
+# three caption lines; layout mirrors the Trash page.
+namespace eval ::dui::pages::ShotHistoryEditor_reconcile {
+    proc setup {} {
+        set page [namespace tail [namespace current]]
+        upvar #0 ::plugins::ShotHistoryEditor::L L
+        ::plugins::ShotHistoryEditor::_page_bg $page
+        set lx $L(left_x); set rx $L(right_x); set cx [expr {($lx+$rx)/2}]
+        set unhide_w $L(btn_w_std)
+        set text_w [expr {$L(content_w)-$unhide_w-$L(lg)}]
+
+        dui add dtext $page $cx $L(header_solo_title_y) -tags page_title -text [translate "Reconcile hidden shots"] \
+            -font $L(font_section) -width $L(content_w) -fill $L(text_body) -anchor center -justify center
+        dui add dtext $page $lx $L(toolbar_y0) -tags reconcile_status -text "" \
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor nw -justify left
+
+        # Two status lines can sit above this header: toolbar_y0 + 2 caption
+        # lines + sm.
+        set header_y [expr {$L(toolbar_y0)+2*$L(caption_h)+$L(sm)}]
+        dui add dtext $page $lx $header_y -tags header \
+            -text "Shot  |  deleted when, batch  |  on disk vs trash copy  |  SDB" \
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
+
+        set n_rows $::plugins::ShotHistoryEditor::reconcile_page_size
+        set list_start [expr {$header_y+$L(caption_h)+$L(md)}]
+        set list_end [expr {$L(bar_y0)-$L(md)}]
+        set row_h [expr {double($list_end-$list_start)/$n_rows}]
+        set row_btn_h [expr {min($L(btn_h), $row_h - $L(sm))}]
+        for {set i 0} {$i < $n_rows} {incr i} {
+            set band_top [expr {$list_start + $i*$row_h}]
+            set ty [expr {$band_top + ($row_h - 3*$L(caption_h))/2.0}]
+            set by0 [expr {$band_top + ($row_h - $row_btn_h)/2.0}]
+            dui add dtext $page $lx $ty -tags row${i}_text -text "" \
+                -font $L(font_caption) -width $text_w -fill $L(text_body) -anchor nw -justify left
+            dui add dbutton $page [expr {$rx-$unhide_w}] $by0 $rx [expr {$by0+$row_btn_h}] \
+                -tags row${i}_unhide -label [translate "Unhide"] \
+                -command "::plugins::ShotHistoryEditor::unhide_row $i" -label_font $L(font_button) -style she_btn
+        }
+
+        set bw $L(btn_w_std)
+        set x $lx
+        dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags page_done \
+            -label [translate "Done"] -command ::dui::pages::ShotHistoryEditor_reconcile::page_done \
+            -label_font $L(font_button) -style she_btn
+        incr x [expr {$bw+$L(sm)}]
+        dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags back \
+            -label [translate "Back"] -command {::plugins::ShotHistoryEditor::_return_to_page ShotHistoryEditor_advanced} \
+            -label_font $L(font_button) -style she_btn
+        incr x [expr {$bw+$L(sm)}]
+        dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags reconcile_prev_page \
+            -label [translate "[::plugins::ShotHistoryEditor::_u 0x25c0] Prev"] -command {::plugins::ShotHistoryEditor::scroll_reconcile -1} \
+            -label_font $L(font_button) -style she_btn
+        incr x [expr {$bw+$L(sm)}]
+        dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags reconcile_next_page \
+            -label [translate "Next [::plugins::ShotHistoryEditor::_u 0x25b6]"] -command {::plugins::ShotHistoryEditor::scroll_reconcile 1} \
+            -label_font $L(font_button) -style she_btn
+    }
+
+    proc show {page_to_hide page_to_show} {
+        set ::plugins::ShotHistoryEditor::reconcile_offset 0
+        set ::plugins::ShotHistoryEditor::reconcile_note ""
+        ::plugins::ShotHistoryEditor::refresh_reconcile_page $page_to_show
+    }
+
+    # Only ever reached from Advanced, matching its Back button.
+    proc page_done {} {
+        ::plugins::ShotHistoryEditor::_return_to_page ShotHistoryEditor_advanced
+    }
+}
+
+# v0.11.0: Empty trash PREVIEW. Diagnostics skeleton (paged text, Done / Back /
+# Prev / Next); content from empty_trash_preview_text; reached from the Trash
+# page and returns there. Nothing on this page deletes anything.
+namespace eval ::dui::pages::ShotHistoryEditor_empty_preview {
+    proc setup {} {
+        set page [namespace tail [namespace current]]
+        upvar #0 ::plugins::ShotHistoryEditor::L L
+        ::plugins::ShotHistoryEditor::_page_bg $page
+        set lx $L(left_x); set rx $L(right_x); set cx [expr {($lx+$rx)/2}]
+
+        dui add dtext $page $cx $L(header_solo_title_y) -tags page_title -text [translate "Empty trash - preview"] \
+            -font $L(font_section) -width $L(content_w) -fill $L(text_body) -anchor center -justify center
+        dui add dtext $page $lx $L(toolbar_y0) -tags empty_preview_page_status -text "" \
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor nw -justify left
+        dui add dtext $page $lx $L(list_top) -tags empty_preview_text -text "" \
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
+
+        set bw $L(btn_w_std)
+        set x [expr {$lx+$bw+$L(sm)}]
+        dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags back \
+            -label [translate "Back"] -command {::plugins::ShotHistoryEditor::_return_to_page ShotHistoryEditor_trash} \
+            -label_font $L(font_button) -style she_btn
+        incr x [expr {$bw+$L(sm)}]
+        dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags prev_page \
+            -label [translate "Prev"] -command {::plugins::ShotHistoryEditor::scroll_page empty_preview -1 ShotHistoryEditor_empty_preview} \
+            -label_font $L(font_button) -style she_btn
+        incr x [expr {$bw+$L(sm)}]
+        dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags next_page \
+            -label [translate "Next"] -command {::plugins::ShotHistoryEditor::scroll_page empty_preview 1 ShotHistoryEditor_empty_preview} \
+            -label_font $L(font_button) -style she_btn
+        dui add dbutton $page $lx $L(bar_y0) [expr {$lx+$bw}] $L(bar_y1) -tags page_done \
+            -label [translate "Done"] -command ::dui::pages::ShotHistoryEditor_empty_preview::page_done \
+            -label_font $L(font_button) -style she_btn
+        # v0.12.0: the real action, far right, danger label; hidden while the
+        # trash is empty. Opens the typed confirmation; deletes nothing itself.
+        dui add dbutton $page [expr {$rx-$bw}] $L(bar_y0) $rx $L(bar_y1) -tags empty_now \
+            -label [translate "Empty trash"] -label_fill $L(danger) \
+            -command ::plugins::ShotHistoryEditor::open_purge_confirm \
+            -label_font $L(font_button) -style she_btn
+    }
+
+    proc show {page_to_hide page_to_show} {
+        set ::plugins::ShotHistoryEditor::empty_preview_page_index 0
+        ::plugins::ShotHistoryEditor::scroll_page empty_preview 0 $page_to_show
+        if {[llength [::plugins::ShotHistoryEditor::_trash_batches]] > 0} {
+            catch { dui item show $page_to_show empty_now* -initial 1 }
+        } else {
+            catch { dui item hide $page_to_show empty_now* -initial 1 }
+        }
+    }
+
+    # Only ever reached from the Trash page, matching its Back button.
+    proc page_done {} {
+        ::plugins::ShotHistoryEditor::_return_to_page ShotHistoryEditor_trash
+    }
+}
+
+# v0.12.0: Empty trash -- typed confirmation (copy of the delete confirm page;
+# the entry stays in the top half for the Android keyboard).
+namespace eval ::dui::pages::ShotHistoryEditor_purge_confirm {
+    proc setup {} {
+        set page [namespace tail [namespace current]]
+        upvar #0 ::plugins::ShotHistoryEditor::L L
+        ::plugins::ShotHistoryEditor::_page_bg $page
+        set lx $L(left_x); set rx $L(right_x); set cx [expr {($lx+$rx)/2}]
+
+        dui add dtext $page $cx $L(header_solo_title_y) -tags page_title -text [translate "Empty trash -- Confirm (permanent)"] \
+            -font $L(font_section) -width $L(content_w) -fill $L(danger) -anchor center -justify center
+        dui add dtext $page $lx $L(toolbar_y0) -tags purge_instructions -text "" \
+            -font $L(font_body) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
+        dui add entry $page $lx [expr {$L(toolbar_y0)+3*$L(lg)}] -tags purge_entry \
+            -textvariable ::plugins::ShotHistoryEditor::purge_input \
+            -width 20 -font $L(font_primary) -borderwidth 1 -bg $L(entry_danger_bg) -foreground $L(danger) -relief flat \
+            -label [translate "Type the number here"] -label_pos [list $lx [expr {$L(toolbar_y0)+2*$L(lg)}]] \
+            -label_font $L(font_body) -label_width $L(label_col_w) -label_fill $L(text_body)
+        dui add dtext $page $lx [expr {$L(toolbar_y0)+5*$L(lg)}] -tags purge_error_text -text "" \
+            -font $L(font_caption) -width $L(content_w) -fill $L(danger) -anchor nw -justify left
+
+        dui add dbutton $page $lx $L(bar_y0) [expr {$lx+$L(btn_w_std)}] $L(bar_y1) -tags cancel \
+            -label [translate "Cancel"] -command ::plugins::ShotHistoryEditor::cancel_purge_confirm \
+            -label_font $L(font_button) -style she_btn
+        dui add dbutton $page [expr {$rx-$L(btn_w_wide)}] $L(bar_y0) $rx $L(bar_y1) -tags purge_confirm_btn \
+            -label [translate "Remove permanently"] -label_fill $L(danger) \
+            -command ::plugins::ShotHistoryEditor::confirm_purge_submit \
+            -label_font $L(font_button) -style she_btn
+    }
+
+    proc show {page_to_hide page_to_show} {
+        ::plugins::ShotHistoryEditor::refresh_purge_confirm_page $page_to_show
+    }
+}
+
+namespace eval ::dui::pages::ShotHistoryEditor_purge_result {
+    proc setup {} {
+        set page [namespace tail [namespace current]]
+        upvar #0 ::plugins::ShotHistoryEditor::L L
+        ::plugins::ShotHistoryEditor::_page_bg $page
+        set lx $L(left_x); set rx $L(right_x); set cx [expr {($lx+$rx)/2}]
+
+        dui add dtext $page $cx $L(header_solo_title_y) -tags page_title -text [translate "Empty trash - result"] \
+            -font $L(font_section) -width $L(content_w) -fill $L(text_body) -anchor center -justify center
+        dui add dtext $page $lx $L(list_top) -tags purge_result_text -text "" \
+            -font $L(font_body) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
+
+        dui add dbutton $page $lx $L(bar_y0) [expr {$lx+$L(btn_w_std)}] $L(bar_y1) -tags page_done \
+            -label [translate "Done"] -command ::plugins::ShotHistoryEditor::close_purge_result \
+            -label_font $L(font_button) -style she_btn
+    }
+
+    proc show {page_to_hide page_to_show} {
+        ::plugins::ShotHistoryEditor::refresh_purge_result_page $page_to_show
     }
 }

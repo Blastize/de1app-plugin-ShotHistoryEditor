@@ -1,7 +1,130 @@
 # Shot History Editor
 
-Version: v0.8.1
+Version: v0.13.0
 Author: Blastize
+
+## Tidy empty trash folders (v0.13.0)
+
+Restoring a batch moves its files back but used to leave the empty batch
+folder behind. Advanced > "Tidy empty trash folders" removes every empty
+folder directly under the plugin trash, and nothing else: files, batches
+and anything inside a folder are untouched, and one TIDY line goes to the
+delete log. Empty trash now does the same sweep after removing its files,
+so old leftovers go with it. The preview page says how many empty folders
+exist. This extends the owner's permanent-deletion exception in CLAUDE.md
+to empty folders under the trash.
+
+## Empty trash, real (v0.12.0) -- PERMANENT DELETION
+
+The plugin's sixth write capability and its first permanent deletion,
+owner-authorized on 2026-09-18 under a one-line exception to the
+workspace's "never permanent deletion" rule. Trash page > "Empty trash..."
+shows the preview; its far-right red "Empty trash" button opens a typed
+confirmation (the number of batches); "Remove permanently" then runs the
+purge and shows a result page.
+
+The write path, in full: the batch set must be unchanged since the
+confirmation opened. For every trash-manifest line, the trash path must
+resolve strictly inside `plugins/ShotHistoryEditor/trash/` (anything else is
+kept and logged) and be a listed file (a missing one is logged as "already
+gone" and its line dropped). Each such file is deleted, one `file delete`
+per file; each batch folder is deleted only once it is empty. Every file
+gets a line in the append-only `purge_log.txt`
+(`ts|batch|orig|trash|bytes|status`), the trash manifest is rewritten
+without the removed lines, and `delete_log.txt` gets one PURGE summary line.
+Nothing under history/ or history_v2/ and nothing in SDB is touched. There
+is no undo: restore what you still want before emptying.
+
+## Empty trash, preview stage (v0.11.0)
+
+No change to any write capability; nothing is deleted in this version. The
+Trash page gains an "Empty trash..." button that opens a preview page: for
+every trash batch the date, batch id, shot and file counts, whether the
+files are still present, their size and age, then the totals a future Empty
+trash would remove permanently. This is the preview stage of the plugin's
+destructive-feature process. Real permanent deletion does not exist and
+would need the workspace's "never permanent deletion" rule and the verify
+harness audit changed first, in a separate explicit pass.
+
+## Reconcile action: Unhide (v0.10.0)
+
+Adds the plugin's fifth write capability, owner-authorized. The Reconcile
+page (Advanced > Reconcile hidden shots) is now a row list with an Unhide
+button per shot. Unhide appends one line to the plugin's own
+`reconcile_manifest.txt` (`unhidden_at|ts|orig|batch`, the exact trash
+manifest line it refers to) and one `RECONCILE UNHIDE` line to
+`delete_log.txt`. That is the entire write path: the trash manifest is never
+edited, no file is moved, and nothing under history/ is touched. From then
+on that manifest line hides nothing, so the shot is back in the card list
+and Source Inspector, while its trash entry and any trash copy stay exactly
+where they were (Restore keeps reporting the collision). Because the marker
+is tied to that one line, deleting the shot again hides it again, which is
+also how to undo an Unhide.
+
+## Trash page Next button (v0.9.1)
+
+Bugfix; no change to any write capability. The Trash / Restore page had a
+Prev button but no Next, so once more than six batches had been deleted
+the older ones could not be reached. Next now sits beside Prev, appears
+only while more batches follow, and the page can no longer scroll past
+the last batch.
+
+## Reconcile hidden shots, read-only view (v0.9.0)
+
+New page under Advanced; no change to any write capability. A shot the
+trash manifest lists as deleted is hidden from every list here for as long
+as that line stands. If its file turns up in history/ again (the app's own
+flush-save bug did this once; a hand copy or a failed restore could too),
+the shot is on disk and back in SDB, yet invisible here, cannot be deleted
+here, and Restore reports a collision for it. The new view lists exactly
+those shots: when and in which batch they were deleted, the on-disk file's
+modification time, whether the trash copy still exists (a stale manifest
+line, or two different files), and what SDB thinks. The Advanced note and
+Diagnostics show the count. Nothing on this page changes anything; the
+un-hide action, if wanted, is a separate later step.
+
+## Source Inspector shows 7 shots (v0.8.6)
+
+Small behaviour change, owner-approved; no change to any write capability.
+The Source Inspector (Advanced > Source Inspector) lists the latest 7 SDB
+shots instead of 8, so its Open buttons reach the full touch height like
+every other button in the plugin. One variable now drives the row count,
+the refresh loop and the query.
+
+## Polish batch (v0.8.5)
+
+Visual-only; no change to any write capability. The Trash page's Restore
+buttons are now full touch height and centred on their row, and the
+Source Inspector's Open buttons are taller and evenly spaced (the row
+count keeps them a little under the full height). The pencil, arrow and
+checkbox glyphs in button labels are built from their code points so the
+source is plain ASCII; they render exactly as before. A stray Windows `desktop.ini`
+no longer ships with the plugin.
+
+## Header / row gap (v0.8.4)
+
+Layout-only bugfix; no change to any write capability. On the Trash and
+Source Inspector pages the column header touched the first row (the
+caption line is taller than the gap the list started at). A new layout
+token holds the caption font's real line height in virtual units and both
+lists now start below it, with the rows redistributed over the remaining
+space. Regression net: `tools/check_header_gap.tcl`.
+
+## Review follow-ups (v0.8.3)
+
+Navigation/logging hygiene pass from the 2026-09-17 code review; no change
+to any write capability. Log lines carry their real severity (the wrapper
+now passes `-NOTICE`/`-INFO` where the core logger reads it), a failed
+Done/Back exit is logged instead of swallowed, every Back button unwinds
+the dialog stack the same way its neighbouring Done does, and the Source
+Inspector's Open buttons hide with the same `-initial 1` form as the rest.
+
+## Idempotent SDB close (v0.8.2)
+
+Log-hygiene bugfix; no change to any write capability. The read-only SDB
+handle is now closed only when it actually exists, so the old bare
+`catch { $db_handle close }` no longer fails on every open and leaks a
+stale `$::errorInfo` into the app's "BLE error info" log line.
 
 ## Card-list pagination fixes (v0.8.1)
 

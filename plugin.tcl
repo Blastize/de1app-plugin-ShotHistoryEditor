@@ -65,7 +65,7 @@ namespace eval ::plugins::ShotHistoryEditor {
     # prefixed value logged as "vv0.6.3" (v0.6.4). Every other plugin on the
     # tablet stores a bare number here too; the core only reads this variable
     # to decide whether the plugin's metadata loaded, and never displays it.
-    variable version     "0.8.1"
+    variable version     "0.13.0"
     variable name        "Shot History Editor"
     variable description "Card-based shot browser with real metadata save and soft delete (move to trash, restorable) for DE1app shot history."
 
