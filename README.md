@@ -7,6 +7,8 @@ Version v0.19.0 · a plugin for the Decent DE1app · by Blastize
 
 **Your shots as cards.** Grind, dose, yield, time, bean and profile, five per page, newest first. Edit on the card, Select to pick shots for the trash. Cleaning runs are marked CLEANING on a tinted card.
 
+![The Bags tab: six bag tiles with roaster, name, roast level and date, notes, shot count, date range and an Edit bag button; the bag in use is marked](docs/bags.png)
+
 **Your bags.** The Bags tab groups your shots by roaster and bag name, six tiles a page: roast level and date, notes, how many shots and when, and which bag is in use. Edit bag changes the roaster, name, notes, roast date or roast level of every shot of a bag at once, after checked backups and a typed confirmation.
 
 ![Edit Preview: pick one field, type the new value, preview before and after, then save](docs/edit_preview.png)
