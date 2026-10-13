@@ -1,7 +1,7 @@
 # Shot History Editor
 
 **Browse your shots as cards, fix a wrong grind or bean name, delete mistakes to a restorable trash.**
-Version v0.19.0 · a plugin for the Decent DE1app · by Blastize
+Version v0.19.1 · a plugin for the Decent DE1app · by Blastize
 
 ![The shot list: five cards per page with grind, dose, yield, time, bean and profile](docs/shot_list.png)
 
@@ -44,7 +44,7 @@ SDB is read-only. Edits rewrite exactly one line of one `.shot` file after a who
 
 ## Reference
 
-Version: v0.19.0
+Version: v0.19.1
 Author: Blastize
 
 ## Your next shot follows a bag edit (v0.18.0, v0.19.0)
