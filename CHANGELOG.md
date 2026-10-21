@@ -4,6 +4,243 @@ Note: entries follow the CLAUDE.md doc cap (about 15 lines each; entries that ad
 changed a write capability keep their full write-path description). The long pre-trim
 entries survive in the Desktop archive snapshot of each version.
 
+## v0.24.0 - FIRST history_v2 WRITE: a Save updates the shot's .json too (2026-10-21)
+
+Base: v0.23.3 (its lows ship in this version; it never ran on the tablet alone). Protocol lane,
+pass_0.24.0.md; John's de1app PR #373 point 3. Owner decisions (2026-10-21): only the edited
+fields; a shot without a .json is left alone; no backfill of earlier edits; never the core
+converter (shot::convert_legacy_to_v2) or SDB's sync_v2_shot_file.
+NEW WRITE CAPABILITY 10 -- history_v2/<ts>.json, written only by `_v2_write` (one caller, `_v2_save`):
+- When: after the .shot write is made, verified and logged -- in perform_metadata_edit (after
+  EDIT OK) and in perform_bag_save for each written file (after BAGSAVE OK and its manifest lines).
+  A refused or failed .shot save never reaches it.
+- What: only the mapped string values (`_v2_paths`: the field's meta value and
+  app.data.settings.<field>); arrays, numbers, sensor series and every other byte stay as they are.
+- Steps:
+  1. Read the .json as bytes; it must be plain UTF-8, else SKIPPED.
+  2. `_v2_patch_text` in memory; a missing or doubled path, or a non-string value, is SKIPPED.
+  3. `_v2_verify` (tcllib json2dict: only those values differ); not checkable means SKIPPED, never
+     an unverified write. Identical bytes are UNCHANGED, with no write.
+  4. `file copy` to <save backup folder>/<ts>.json, compared byte for byte; else FAILED.
+  5. Write-ahead "V2 BEGIN" in edit_log.txt; if it cannot be written, FAILED.
+  6. Temp file <backup folder>/<ts>.json.new, read back byte for byte and verified again.
+  7. One `file rename -force` over the .json, then read back.
+  8. A failed rename or read-back: the backup is copied back and checked (`_bag_restore`);
+     RESTORE_FAILED names the intact copy.
+- Log: edit_log.txt gets V2 OK | UNCHANGED | ABSENT | SKIPPED | FAILED | RESTORE_FAILED; failures
+  are also logged -ERROR.
+- A v2 result never rolls back the .shot and never stops a bag Save. The edit result page gives
+  one history_v2 line; the bag result page gives counts plus any file that failed.
+- Pages: Edit Preview, Edit Confirm, bag Review/Confirm and Help now say what Save does.
+Safety status: write capabilities 1-10 exist; 10 is new. `file rename` 12 (+1, the .json temp),
+`file copy` 5 (+1, the .json backup), `file mkdir` 6, and `file delete` still the two purge-only
+lines. SDB is never written; raw arrays are never touched.
+Tests: pass_0.24.0_offline.tcl (46 checks on copies of real pairs from the 2026-08-09 backup;
+Python's json is the oracle; every step fault-injected); 16 of 16 mutants (mutants_0.24.0.py); every
+earlier net, with the 0.23.0 page texts updated. Mutant runners now remove their read-only copies.
+Tablet: verify.sh PASS on run 2. Run 1 failed only because checks.json still expected the pre-move
+pages; the tablet had moved and its trash was empty. The history_v2 write has not yet run on a
+real Save on the tablet.
+
+## v0.23.3 - Manifest must-exist reads and result-page lows (2026-10-21)
+
+Base: v0.23.2. Protocol lane, pass_0.23.3.md (the lows from an independent review of 0.23.2).
+Changed write paths:
+- Restore (capability 2), Empty trash (6) and the move (9): `_manifest_read` gains must_exist, so a
+  manifest that `file isfile` says is not there refuses (logged -ERROR) instead of reading as an
+  empty manifest that the rewrite then wrote out empty (reproduced by fault injection). Delete keeps
+  the lenient read: its own append-open has just created the file.
+- Restore also refuses, before anything moves, a batch no manifest line names; and when it drops no
+  line (every file collided, refused or failed) it no longer rewrites the manifest (RESTORE line
+  manifest_rewritten=unchanged).
+- Delete (1): a trash folder that cannot be made returns the usual result (trash_path, each shot
+  with its reason, -ERROR logged); the result page threw before.
+Result pages: refresh_note is read with `_dget` (two bare catches dirtied errorInfo on every failed
+save or delete). Harness: scratch copies under a short TEMP; an incomplete copy is SETUP-FAIL, and
+the mutant runners report it as INVALID instead of "caught".
+Safety status: no new write capability; `file rename` 11, `file copy` 4, `file mkdir` 6; `file delete`
+still the two purge-only lines; history_v2 and SDB never written. Tests: pass_0.23.3_offline.tcl
+(18 checks; 9 of 9 mutants, mutants_0.23.3.py) plus every earlier net. Tablet: never alone; it
+ships in v0.24.0 (archived offline-verified as v0.23.3).
+
+## v0.23.2 - Trash manifest and preview fixes, before the owner's move (2026-10-21)
+
+Base: v0.23.1. Protocol lane, pass_0.23.2.md (an independent review of 0.22.0-0.23.1, reproduced on
+a copy of the tablet backup). Changed write paths, all of the trash manifest's in one writer:
+- `_manifest_write` (new; replaces `_rewrite_manifest`): the whole new manifest goes to
+  trash_manifest.txt.new (UTF-8, LF), is read back byte for byte, then one `file rename -force`
+  replaces trash_manifest.txt; any failure leaves the manifest as it was and logs -ERROR (before:
+  `open w` on the manifest itself, so a failed write could truncate it).
+- Restore (capability 2) and Empty trash (capability 6) read the manifest whole with `_manifest_read`
+  and refuse, before any move or delete, when it cannot be read (before: a failed read looked empty
+  and the rewrite emptied the manifest; the files stayed in trash/ but left Trash / Restore). Lines
+  that are not ts|orig|trash|batch are kept as they are (before: dropped). Restore counts a failed
+  folder or rename as "could not be moved back" with its reason logged (was "already in history");
+  the RESTORE line gains failed=N.
+- Delete (capability 1): the manifest is read whole before anything moves; the batch's lines are
+  added through `_manifest_write`, all or none (before: one append, so a partial write on a full
+  disk could leave lines naming files that were then put back). Put-back on failure is unchanged.
+- Metadata save (capability 3): the backup is checked byte for byte before the temp write; a save
+  that fails its check after the rename is put back from the backup by copy (`_bag_restore`, the
+  bag Save's mechanism) and checked; the backup stays. A failed put-back says so and names the
+  intact copy (before: the backup was renamed over the file and "automatically restored" was
+  reported whatever happened).
+- The move (capability 9): a Finish move with nothing left to re-point no longer rewrites the
+  manifest, so a failed commit cannot roll its copy back over a re-pointed manifest; re-pointed
+  lines without trash_manifest.before_move.txt no longer stop Finish move for good (the copy is
+  made again from the manifest as it is; MIGRATE OK audit_copy=remade; the Result page says so).
+Read-only: the history_v2 scanner no longer throws on a file ending in key position; v2_preview
+returns status error for any scan/check error; Edit Confirm sets its own texts first; every
+history_v2 preview line fits one 120-character row. Copy: Help and the delete result say SHE's
+trash/backups folder (history_trash/ after the move); Help says Empty trash also deletes the
+trashed history_v2 .json files; README no longer says the move "never copies".
+Safety status: no new write capability; `file rename` 11, `file copy` 4, `file mkdir` 6 (counts
+unchanged); `file delete` still the two purge-only lines; history_v2 still never written; SDB never
+written. Tests: pass_0.23.2_offline.tcl (45 checks, faults injected on copies of the real backup;
+18 of 18 mutants, mutants_0.23.2.py) plus every earlier net (the 0.22.0 and 0.23.1 delete cases now
+fail the manifest's temp write instead of a second append). Tablet: verify.sh PASS run 2 (run 1
+failed only on a device_log string left at v0.23.1 in checks.json).
+
+## v0.23.1 - The move's review fixes, before its first real run (2026-10-21)
+
+Base: v0.23.0. Protocol lane, pass_0.23.1.md (an independent review of the 0.22.0 move; asked as
+0.22.1, numbered 0.23.1 because 0.23.0 is on the tablet). Changed write paths:
+- The move (capability 9): the trash manifest is read whole or not at all (`_manifest_read`); the
+  plan refuses an unreadable one; step 4 stops at manifest-read, or at manifest-count when the
+  re-read has another line count than the confirmation (before: a failed re-read could write a
+  short manifest and still report "Moved"). The new manifest's read-back can no longer throw. A
+  re-pointed manifest that cannot be put back keeps every item staged with it (unfinished; Finish
+  move completes), never back in the plugin folder; "put back" is checked on the disk (items back,
+  none staged, the manifest's bytes from before). A failing MIGRATE FAILED line is named.
+- Delete (capability 1): when the batch's manifest lines fail and its files are put back, the
+  result page says "Not deleted", lists any file that could not go back and how to recover it,
+  and no longer offers Trash / Restore as the undo; each put-back failure is logged with its reason.
+- Edit (capability 3): edit_manifest / edit_log appends go through `_she_append`; a failed one is
+  logged and shown on the result page.
+Copy fixed: "nothing is copied" (the manifest's audit copy is one), "a MIGRATE line for every step".
+Safety status: no new write capability; the move is still rename-only; `file delete` still the two
+purge-only lines; history_v2 still never written. Tests: pass_0.23.1_offline.tcl (19 checks, faults
+injected on copies of the real backup; 10 of 10 mutants, mutants_0.23.1.py) plus every earlier net;
+mutation scripts for 0.20.0-0.23.0 added (mutants_*.py). Tablet: verify.sh PASS run 1 (pages only).
+
+## v0.23.0 - history_v2 update PREVIEW (2026-10-21)
+
+Base: v0.22.0. Protocol lane, pass_0.23.0.md (John's de1app PR #373 point 3). Owner decisions,
+asked first: a later write updates only the edited fields; a shot without a .json is left alone
+(SDB parity); no backfill. Edit Preview now shows what that write would change in the shot's
+history_v2/<ts>.json -- each path (its meta value and app.data.settings.<field>), old -> new --
+and "Checked" when the patched text, re-read with tcllib json2dict in memory, differs only there.
+Edit Confirm says the Save leaves history_v2 as it is; bag Review counts the files with a copy.
+The preview text is compact: at 12 lines it ran under the Back button. Edit Confirm's Before,
+After and warning lines touched (the known polish item): an xs gap now. Never the core converter
+or SDB's sync_v2_shot_file (they copy the live shot's raw arrays into old files).
+Write change (capability 3, single-field save): it now refuses a value with braces, a backslash
+or a CR, a busy DE1 and an SDB sync, as the bag Save already did; nothing else changed.
+Safety status: history_v2 is still never written; no new write capability; `file delete` still the
+two purge-only lines. Tests: pass_0.23.0_offline.tcl (every real v2 file, 1063, copied to scratch
+and patched with hostile values for all 11 fields, checked by Python's json; scanner traps; the
+verifier; the pages and the refusals; 16 of 17 mutants caught, the 17th equivalent: in valid JSON
+only an object key is followed by a colon) plus every earlier net. Tablet: verify.sh run 2 PASS
+(run 1 failed on the Edit Confirm spacing, fixed above); the filled preview needs a tap (owner).
+
+## v0.22.0 - The one-time move to history_trash: WRITE CAPABILITY 9 (2026-10-21)
+
+Base: v0.21.0 (verify PASS). Protocol lane, pass_0.22.0.md. John's de1app PR #373 point 1; owner
+decision 2026-10-21, CLAUDE.md edited first (purge path, one-time-move rule, packaging rule).
+
+Where SHE's own files live now (`_she_layout`, read-only, no cache): an install that has not moved
+keeps its 8 items (trash/, backups/, six .txt files) in its plugin folder; after the move, and on a
+fresh install from the start, they live in `<data root>/history_trash/`. `_she_legacy_dir` builds
+the plugin folder (never the new root). A move that stopped ("unfinished") or files in two places
+("conflict") make every SHE write refuse with the reason (`_she_write_blocker`: delete, restore,
+single-field edit, bag save, Empty trash, Tidy, Unhide; Advanced says why).
+
+The write path (`perform_she_move`, Advanced > Move trash and logs... > Move now... > type the item
+count > Move). Refused, with nothing written, unless: state legacy (or unfinished: Finish move...),
+the count matches, the folders are as when the confirmation opened, history_trash/ does not exist,
+no item is in two places, every trash-manifest line is ts|orig|trash|batch inside the old trash/,
+the plugin folder, data root and staging are on one device (`file stat` dev) and writable, the DE1
+is idle and SDB is not syncing. Then:
+1. MIGRATE BEGIN line in delete_log.txt (write-ahead; if it fails, nothing moves).
+2. `file mkdir <data root>/history_trash.moving` (an empty one is reused).
+3. One `file rename` per item into it (folders first, delete_log.txt last; never onto an existing
+   name).
+4. trash_manifest.txt: `file copy -force` to trash_manifest.before_move.txt (a fresh copy whenever no
+   line is re-pointed yet), the re-pointed lines written to trash_manifest.txt.new, read back byte
+   for byte, `file rename -force` over the manifest. Only the trash column changes (old trash/ ->
+   history_trash/trash/, same <batch>/<file>); lines already re-pointed are kept; none dropped.
+5. Commit: `file rename history_trash.moving history_trash` (refused if history_trash appeared).
+6. MIGRATE OK + one MIGRATE ITEM line per item; a failed line is shown, the move stands.
+A failing step rolls back what this run did (the manifest renamed back from its copy, the items
+renamed back) and logs MIGRATE FAILED; whatever cannot go back is named and leaves "unfinished".
+A crash leaves "unfinished"; Finish move... runs steps 1-6 again (roll forward only).
+Nothing is copied except the manifest's audit copy, nothing is deleted, history/ and history_v2/
+are not touched. On the owner's tablet the move is the owner's typed tap; a full read-only adb
+backup of the folder is taken first.
+
+Also: trash-record appends no longer swallow failures (final-check refuter): a delete checks the
+manifest can be written before anything moves, and if its lines still fail the files go back to
+history/ (named on the result page if any cannot); delete, restore, Unhide, Tidy and the PURGE
+summary show a failed log line; the purge log is write-ahead ("removing" before each delete; no
+line, no delete). The 0.21.0 review must-fixes 1-7 (notes_0.22.0_must_fix.md). Help names the
+move. Safety status: write capabilities are v0.19.0's eight plus 9 (the move); `file delete` still
+only the two purge-only lines, now strictly inside SHE's trash/ wherever it lives. Tests:
+pass_0.22.0_offline.tcl (88 checks on scratch copies of the real backup: the move, every refusal,
+rollback at each of 11 steps, power loss after each of 18 writes + restart + finish, stale copy,
+states, append failures, history_trash/ appearing mid-move, the split core offline only; 17 of 17
+mutants caught) plus every earlier net
+(0.19.0/0.20.0 and check_trash_pager now model an existing, not-yet-moved install). Tablet:
+verify.sh PASS (run 2 after a Help typo fix); pages only -- the owner's own move has not run.
+
+## v0.21.0 - Moving the trash out of the plugin folder: PREVIEW ONLY (2026-10-21)
+
+Base: v0.20.0. Protocol lane, pass_0.21.0.md (John, de1app PR #373 point 1). The real move waits
+for the CLAUDE.md purge-path and packaging rule change, and destructive features start as a
+preview. Advanced > Recover > Move trash and logs... opens a read-only page: where SHE's 8 items
+are, where the move would put them (`<data root>/history_trash/`), counts and sizes, how the trash
+manifest's trash column would be rewritten (strict prefix, `<batch>/<file>` only), and every reason
+the move would refuse (target exists, an unfinished `history_trash.moving`, files in two places,
+an unmappable line, DE1 busy, SDB syncing, data folder not writable). Diagnostics names the planned
+move. `_she_data_dir` is unchanged for every install. A wrong "copy fallback" comment is corrected.
+Before the code: a read-only backup of the tablet's SHE folder (Version archive/Tablet backups/
+ShotHistoryEditor data 2026-10-21, 126 files, MD5-identical) and a rename probe (inodes kept).
+Safety status: no write behaviour added or changed; the eight write capabilities are v0.19.0's;
+`file delete` still only the two purge-only lines. Tests: pass_0.21.0_offline.tcl (39 checks on a
+copy of the real backup and synthetic states; zero writes traced; 12 mutants caught) plus every
+earlier net. Tablet: verify.sh PASS run 1 (2026-10-21).
+
+## v0.20.0 - History on the app's data root (2026-10-20)
+
+Base: v0.19.1 (the commit John Buckman reviewed in de1app PR #373). Protocol lane, pass_0.20.0.md.
+No new write capability. On every app today data_directory is the same folder as homedir, so
+nothing moves on any device; the tablet's v1.46.1 core has no data_directory and uses homedir.
+Read/write paths changed:
+- history/ and history_v2/ (read, edit, bag Save, delete moves, restore, mtime stamps):
+  [_data_root]/history and /history_v2. `_data_root` is the shared conventions helper:
+  ::data_directory when the core has it, else ::homedir, else (headless) the plugin's grandparent.
+- Restore (capability 2): the target is the record's file name in the CURRENT history folder
+  (<name>.shot -> history/, <name>.json -> history_v2/), never the stored absolute path. Refused
+  and kept in the manifest: a trash file outside the plugin trash, any other extension, a name
+  that is not a plain file name, a trash copy of another name. A refused or collided file, and a
+  trash manifest that could not be rewritten, show as a Trash page note and on delete_log's
+  RESTORE line (`collisions=N refused=N manifest_rewritten=0|1`); only refusals and a failed
+  rewrite also log -NOTICE (corrected 2026-10-21: an earlier wording said collisions did too). A
+  failed rename is counted as a collision. The mkdir now only ever makes history/ or history_v2/.
+- Reconcile and Unhide (capability 5) look for the file in the current history folder too; the
+  manifest and reconcile key strings are unchanged, so existing Unhide markers still match.
+- SDB (read-only): ::plugins::SDB::db_path when it exists and settings(db_path) is set, else
+  the old candidates. On the tablet that is the same file.
+Unchanged: trash/, backups/ and the six manifests and logs stay in plugins/ShotHistoryEditor/,
+all built from one helper (`_she_data_dir`) so the later history_trash move changes one line.
+Also: Diagnostics names the data root; Help says a delete moves the history_v2 .json and that
+Restore puts files back into history/ and history_v2/; a wrong code comment about SDB's
+modify_shot_file fixed.
+Safety status: write capabilities are exactly v0.19.0's eight; `file delete` still only the two
+purge-only lines. Tests: pass_0.20.0_offline.tcl (70 checks; a stub data_directory that differs
+from homedir is proven OFFLINE ONLY -- the tablet exercises only the homedir branch; homedir-only
+path strings equal v0.19.1's; 13 mutants caught) plus every earlier net. Tablet: verify.sh PASS
+run 1 (2026-10-21); Advanced, Trash and Reconcile read the same before and after the push.
+
 ## v0.19.1 - Help page split in two (2026-10-13)
 
 Base: v0.19.0. Polish lane, found in the 2026-10-13 skin-compatibility test (Insight, DSx2,

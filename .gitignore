@@ -20,6 +20,12 @@ trash_manifest.txt
 delete_log.txt
 edit_manifest.txt
 edit_log.txt
+purge_log.txt
+reconcile_manifest.txt
+trash_manifest.before_move.txt
+*.new
+history_trash/
+history_trash.moving/
 
 # Version archives
 *Archive/

@@ -17,8 +17,8 @@
 #      block (via a verified temp-file + atomic `file rename`), after first
 #      copying the whole original file to plugins/ShotHistoryEditor/
 #      backups/. Every other byte of the file -- including the raw sensor
-#      arrays -- is preserved untouched. history_v2/*.json is never written
-#      by a save.
+#      arrays -- is preserved untouched. (v0.24.0: the shot's history_v2
+#      .json then gets the same field -- write capability 10, below.)
 # - `file delete` is never called on a history file anywhere in this file.
 # - Raw chart and sensor arrays are never displayed for editing and never
 #   modified by either write path.
@@ -27,13 +27,60 @@
 #   roast_level) in every history/<f>.shot of one bag after a typed file
 #   count -- verified backups first, binary-exact rewrite of only those
 #   entries, read-back checks, restore on failure, write-ahead edit_log.
-#   No file delete; SDB and history_v2 never written.
+#   No file delete; SDB never written (history_v2: see v0.24.0).
 # - v0.19.0 next-shot update (write capability 8): after a bag Save that
 #   wrote files, when DYE's next-shot plan names exactly the saved bag,
 #   _bag_next_apply applies the changed bag fields to it through DYE's own
 #   get_next + source_next_from (BeanScanner's call), logged BAGSAVE NEXT
 #   BEGIN / OK | FAILED | SKIPPED. SHE never writes ::settings or DYE's
 #   settings itself.
+# - v0.20.0 paths: history/ and history_v2/ are found under the app's data
+#   root (_data_root: data_directory, else homedir -- the same folder on
+#   every platform today); SHE's own trash, backups, manifests and logs stay
+#   in plugins/ShotHistoryEditor/ (_she_data_dir); a trash record's stored
+#   path is rebased onto the current history folders before any disk use
+#   (_rebased_orig). No new write capability.
+# - v0.21.0: Advanced > Move trash and logs... PREVIEWS the later move of
+#   SHE's own files to [_data_root]/history_trash (what would move, every
+#   reason it would refuse). Read-only.
+# - v0.22.0 one-time move (write capability 9): perform_she_move renames
+#   SHE's OWN 8 items from the plugin folder into [_data_root]/history_trash
+#   after a typed count (rename only, one device; rollback on failure, roll
+#   forward after a crash). _she_data_dir follows the files: the plugin
+#   folder until the move, history_trash after it and on a fresh install.
+#   While a move is unfinished or the files are in two places, every SHE
+#   write is refused (_she_write_blocker). Trash-record appends are no
+#   longer swallowed; the purge log is write-ahead.
+# - v0.23.0: history_v2 PREVIEW -- Edit Preview shows what a later version
+#   would change in the shot's history_v2/<ts>.json (only the edited field's
+#   meta and app.data.settings values), checked in memory; bag Review counts
+#   the copies. Nothing writes history_v2. The single-field save now refuses
+#   braces/backslashes, a busy DE1 and an SDB sync, like the bag Save.
+# - v0.23.1 (review of the move, before its first real run): the manifest
+#   is read whole or not at all and must keep the plan's line count; a
+#   manifest that cannot be put back keeps every item in staging; "put
+#   back" is checked on the disk; the delete result tells the truth when a
+#   batch was put back; no trash or edit append is a bare catch.
+# - v0.23.2 (review before the move): Restore and Empty trash read the
+#   trash manifest whole or refuse, and every manifest change (delete,
+#   restore, purge) is one _manifest_write: temp file, read back, rename;
+#   lines it cannot parse are kept. A Finish move never rewrites a manifest
+#   with nothing left to re-point. The history_v2 preview cannot throw; its
+#   lines fit one row each. A failed single-field save is put back from its
+#   checked backup by copy and checked; restore failures are counted.
+# - v0.23.3 (review of 0.23.2): Restore, Empty trash and the move read the
+#   manifest with must_exist (a stat that says "no file" refuses instead of
+#   reading empty); Restore refuses a batch the manifest does not name and
+#   does not rewrite when it drops no line; the result pages read
+#   refresh_note with _dget (no catch); a trash folder that cannot be made
+#   gives a normal delete result.
+# - v0.24.0 FIRST history_v2 WRITE (write capability 10): after a .shot
+#   write is made, verified and logged (single-field Save, each file of a
+#   bag Save), _v2_save changes the same field(s) in history_v2/<ts>.json:
+#   only the mapped string values, patched in memory and re-read with tcllib
+#   json, a checked backup, write-ahead V2 BEGIN, temp + read-back + one
+#   rename, restore from the backup on a bad rename/read-back. A v2 result
+#   never undoes or stops the .shot write. No .json: left alone.
 #
 
 catch { package require sqlite3 }
@@ -62,6 +109,15 @@ namespace eval ::plugins::ShotHistoryEditor {
     # v0.11.0: "Empty trash" PREVIEW page (paged text). Nothing is deleted in
     # this version; see empty_trash_preview_text.
     variable empty_preview_page_index 0
+    # v0.21.0: the history_trash move preview (read-only).
+    variable migrate_preview_page_index 0
+    # v0.22.0: the move's typed confirmation (the plan snapshot and the count
+    # it is typed for, taken when the confirmation page shows) and its result.
+    variable migrate_input ""
+    variable migrate_error ""
+    variable migrate_snap ""
+    variable migrate_count ""
+    variable migrate_result_text "No move has run yet."
     # v0.12.0: real Empty trash. Snapshot of the batch ids taken when the
     # confirmation opens (perform_purge refuses if the set changed), the typed
     # confirmation, and the result text.
@@ -370,6 +426,7 @@ proc ::plugins::ShotHistoryEditor::_retheme_all {} {
         ShotHistoryEditor_edit_confirm confirm_before_text text_body
         ShotHistoryEditor_edit_confirm confirm_after_text danger
         ShotHistoryEditor_edit_confirm confirm_warning_text warn
+        ShotHistoryEditor_edit_confirm confirm_v2_text text_mut
         ShotHistoryEditor_edit_result edit_result_text text_body
         ShotHistoryEditor_trash trash_status text_mut
         ShotHistoryEditor_recent recent_status text_mut
@@ -392,6 +449,12 @@ proc ::plugins::ShotHistoryEditor::_retheme_all {} {
         ShotHistoryEditor_reconcile header text_body
         ShotHistoryEditor_empty_preview empty_preview_page_status text_mut
         ShotHistoryEditor_empty_preview empty_preview_text text_body
+        ShotHistoryEditor_migrate_preview migrate_preview_page_status text_mut
+        ShotHistoryEditor_migrate_preview migrate_preview_text text_body
+        ShotHistoryEditor_migrate_confirm migrate_instructions text_body
+        ShotHistoryEditor_migrate_confirm migrate_error_text danger
+        ShotHistoryEditor_migrate_confirm migrate_summary text_mut
+        ShotHistoryEditor_migrate_result migrate_result_text text_body
         ShotHistoryEditor_purge_confirm purge_instructions text_body
         ShotHistoryEditor_purge_confirm purge_error_text danger
         ShotHistoryEditor_purge_result purge_result_text text_body
@@ -433,6 +496,9 @@ proc ::plugins::ShotHistoryEditor::_retheme_all {} {
     catch { dui item config ShotHistoryEditor_purge_confirm purge_entry \
         -bg $L(entry_danger_bg) -foreground $L(danger) }
     catch { dui item config ShotHistoryEditor_purge_confirm purge_entry-lbl -fill $L(text_body) }
+    catch { dui item config ShotHistoryEditor_migrate_confirm migrate_entry \
+        -bg $L(entry_bg) -foreground $L(value_blue) }
+    catch { dui item config ShotHistoryEditor_migrate_confirm migrate_entry-lbl -fill $L(text_body) }
     catch { dui item config ShotHistoryEditor_edit_preview new_value \
         -bg $L(entry_bg) -foreground $L(value_blue) }
     catch { dui item config ShotHistoryEditor_edit_preview new_value-lbl -fill $L(text_body) }
@@ -441,7 +507,8 @@ proc ::plugins::ShotHistoryEditor::_retheme_all {} {
     foreach {p tags} {
         ShotHistoryEditor_settings {mode_btn bar_left bar_right btn_theme
                                     row0_btn row1_btn row2_btn row3_btn row4_btn}
-        ShotHistoryEditor_advanced {source_inspector diagnostics help_guide trash_restore reconcile}
+        ShotHistoryEditor_advanced {source_inspector diagnostics help_guide trash_restore reconcile
+                                    migrate_preview}
         ShotHistoryEditor_delete_review {cancel continue_btn}
         ShotHistoryEditor_delete_confirm {cancel confirm_delete}
         ShotHistoryEditor_delete_result {page_done}
@@ -457,6 +524,9 @@ proc ::plugins::ShotHistoryEditor::_retheme_all {} {
         ShotHistoryEditor_reconcile {row0_unhide row1_unhide row2_unhide row3_unhide
                                      row4_unhide row5_unhide}
         ShotHistoryEditor_empty_preview {empty_now}
+        ShotHistoryEditor_migrate_preview {migrate_now}
+        ShotHistoryEditor_migrate_confirm {cancel migrate_confirm_btn}
+        ShotHistoryEditor_migrate_result {page_done}
         ShotHistoryEditor_purge_confirm {cancel purge_confirm_btn}
         ShotHistoryEditor_purge_result {page_done}
     } {
@@ -846,6 +916,10 @@ proc ::plugins::ShotHistoryEditor::preload_pages {} {
     dui page add ShotHistoryEditor_empty_preview -namespace true -theme default -type fpdialog
     dui page add ShotHistoryEditor_purge_confirm -namespace true -theme default -type fpdialog
     dui page add ShotHistoryEditor_purge_result -namespace true -theme default -type fpdialog
+    # v0.21.0: the history_trash move page; v0.22.0: its confirmation and result.
+    dui page add ShotHistoryEditor_migrate_preview -namespace true -theme default -type fpdialog
+    dui page add ShotHistoryEditor_migrate_confirm -namespace true -theme default -type fpdialog
+    dui page add ShotHistoryEditor_migrate_result -namespace true -theme default -type fpdialog
     # v0.16.0: the Bags tab and its (preview-only) editor.
     dui page add ShotHistoryEditor_bags -namespace true -theme default -type fpdialog
     dui page add ShotHistoryEditor_bag_edit -namespace true -theme default -type fpdialog
@@ -1008,7 +1082,27 @@ proc ::plugins::ShotHistoryEditor::_plugins_dir {} {
     return [file dirname $plugin_dir]
 }
 
+namespace eval ::plugins::ShotHistoryEditor {
+    # Writable user-data root. de1app main (since e14b7d0, 2026-06-23) has
+    # data_directory; older cores (stable v1.46.1, the tablet) have only homedir.
+    # Both return the same folder on Android/macOS today. No catch, never throws.
+    proc _data_root {} {
+        if {[llength [info commands ::data_directory]]} { return [::data_directory] }
+        if {[llength [info commands ::homedir]]}        { return [::homedir] }
+        variable plugin_dir    ;# headless tests only: <root>/plugins/<Name>
+        return [file dirname [file dirname $plugin_dir]]
+    }
+}
+
+# v0.20.0: SDB's own answer first (it honours a custom settings(db_path); SDB
+# 1.26 on the tablet and upstream both have db_path, still homedir-rooted),
+# else the two places SDB keeps it by default.
 proc ::plugins::ShotHistoryEditor::sdb_path {} {
+    if {[llength [info commands ::plugins::SDB::db_path]] &&
+        [info exists ::plugins::SDB::settings(db_path)] &&
+        [string trim $::plugins::SDB::settings(db_path)] ne ""} {
+        return [::plugins::SDB::db_path]
+    }
     set candidates [list \
         [file join [_plugins_dir] SDB shots.db] \
         [file join [_homedir] plugins SDB shots.db]]
@@ -1018,12 +1112,739 @@ proc ::plugins::ShotHistoryEditor::sdb_path {} {
     return [lindex $candidates 0]
 }
 
+# v0.20.0: the app's history folders live under its data root (John, de1app
+# PR #373). SHE reads and writes both there: edits, moves, mtime stamps.
 proc ::plugins::ShotHistoryEditor::history_path {} {
-    return [file join [_homedir] history]
+    return [file join [_data_root] history]
 }
 
 proc ::plugins::ShotHistoryEditor::history_v2_path {} {
-    return [file join [_homedir] history_v2]
+    return [file join [_data_root] history_v2]
+}
+
+# ---------------------------------------------------------------------------
+# v0.22.0 -- where SHE's own files live (John, de1app PR #373: users' trash,
+# backups and logs belong under the app's data folder, not the plugin's code
+# folder). SHE keeps 8 items: trash/, backups/ and six .txt manifests and
+# logs. They live in <data root>/history_trash/ once the one-time move has
+# run (Advanced > Move trash and logs..., perform_she_move) and on a fresh
+# install; an install that has not moved yet keeps them in its plugin folder
+# (CLAUDE.md purge exception and one-time-move rule, 2026-10-21). trash/
+# holds nothing but batch folders: Tidy and Empty trash remove every empty
+# folder directly under it. (v0.21.0 previewed the move read-only; measured
+# on the tablet 2026-10-21 with adb: a folder renamed from
+# plugins/ShotHistoryEditor/ to the de1plus root keeps every inode and the
+# device -- a true rename, never a copy, on this storage.)
+# ---------------------------------------------------------------------------
+
+# The plugin folder SHE's files lived in before the move: the one place that
+# builds it, and never the new root (so a moved install can still see a
+# leftover there as a conflict).
+proc ::plugins::ShotHistoryEditor::_she_legacy_dir {} {
+    return [file join [_plugins_dir] ShotHistoryEditor]
+}
+
+# The folder SHE reads and writes its own files in NOW (see _she_layout).
+proc ::plugins::ShotHistoryEditor::_she_data_dir {} {
+    return [dict get [_she_layout] root]
+}
+
+# One item's path. Only while a move is unfinished can items sit in two
+# folders: then it is wherever the item is (the staging folder first).
+proc ::plugins::ShotHistoryEditor::_she_entry_path {name} {
+    set lay [_she_layout]
+    set p [file join [dict get $lay root] $name]
+    if {[dict get $lay state] eq "unfinished" && ![file exists $p] && [dict get $lay from] ne ""} {
+        set q [file join [dict get $lay from] $name]
+        if {[file exists $q]} { return $q }
+    }
+    return $p
+}
+
+# "" when SHE may write its own files, else why not. Checked by every write
+# path before it touches anything (delete, restore, edit, bag save, Empty
+# trash, Tidy, Unhide); the move itself has its own checks.
+proc ::plugins::ShotHistoryEditor::_she_write_blocker {} {
+    set lay [_she_layout]
+    switch -- [dict get $lay state] {
+        unfinished {
+            return [translate "the move of the trash to history_trash/ is unfinished; finish it under Advanced > Move trash and logs..."]
+        }
+        conflict {
+            return [translate "the plugin's trash, backups and logs are in more than one folder (see Diagnostics); nothing is written until only one holds them"]
+        }
+    }
+    return ""
+}
+
+# Everything SHE keeps in its folder: two folders and six text files. The
+# move renames exactly these; plugin code, docs and the app's settings.tdb
+# stay.
+proc ::plugins::ShotHistoryEditor::_she_entries {} {
+    return {trash backups trash_manifest.txt delete_log.txt purge_log.txt
+            reconcile_manifest.txt edit_manifest.txt edit_log.txt}
+}
+
+proc ::plugins::ShotHistoryEditor::_she_new_root {} {
+    return [file join [_data_root] history_trash]
+}
+
+proc ::plugins::ShotHistoryEditor::_she_staging_root {} {
+    return [file join [_data_root] history_trash.moving]
+}
+
+# The folders SHE's files can be in today, in the order a move looks: the
+# data-root mirror of the plugin folder (where the app keeps plugin
+# settings, and where they would be after a code/data split), then the
+# plugin folder itself. On every platform today both are one folder.
+proc ::plugins::ShotHistoryEditor::_she_legacy_roots {} {
+    set pd plugins
+    if {[llength [info commands ::plugin_directory]]} { set pd [::plugin_directory] }
+    set cands {}
+    if {[file pathtype $pd] ne "absolute"} { lappend cands [file join [_data_root] $pd ShotHistoryEditor] }
+    lappend cands [_she_legacy_dir]
+    set out {} ; set seen {}
+    foreach c $cands {
+        set n [file normalize $c]
+        if {$n ni $seen} { lappend seen $n ; lappend out $c }
+    }
+    return $out
+}
+
+proc ::plugins::ShotHistoryEditor::_she_entries_in {root} {
+    set found {}
+    foreach e [_she_entries] {
+        if {[file exists [file join $root $e]]} { lappend found $e }
+    }
+    return $found
+}
+
+# Where SHE's files are, read-only (no cache: a handful of stats, and every
+# write path sees the disk as it is). state:
+#   legacy      one plugin folder holds them (an install that has not moved)
+#   fresh       none anywhere (a new install starts in history_trash/)
+#   moved       only history_trash/ holds them
+#   unfinished  history_trash.moving holds some (a move that stopped)
+#   conflict    more than one folder holds them
+# root: the folder SHE uses now. from: the one legacy folder holding items,
+# else "". An EMPTY history_trash.moving (left by a rolled-back move) is
+# not a state: the next move reuses it.
+proc ::plugins::ShotHistoryEditor::_she_layout {} {
+    set holders {}
+    foreach r [_she_legacy_roots] {
+        if {[llength [_she_entries_in $r]]} { lappend holders $r }
+    }
+    set new [_she_new_root]
+    set staging [_she_staging_root]
+    set new_entries {}
+    if {[file isdirectory $new]} { set new_entries [_she_entries_in $new] }
+    set staging_entries {}
+    if {[file isdirectory $staging]} { set staging_entries [_she_entries_in $staging] }
+    if {[llength $staging_entries]} {
+        set state unfinished
+        set root $staging
+    } elseif {[llength $holders] > 1 || ([llength $holders] == 1 && [llength $new_entries])} {
+        set state conflict
+        set root [_pick [llength $new_entries] $new [lindex $holders 0]]
+    } elseif {[llength $holders] == 1} {
+        set state legacy
+        set root [lindex $holders 0]
+    } elseif {[llength $new_entries]} {
+        set state moved
+        set root $new
+    } else {
+        set state fresh
+        set root $new
+    }
+    set from ""
+    if {[llength $holders] == 1} { set from [lindex $holders 0] }
+    return [dict create state $state root $root from $from holders $holders new $new \
+        new_exists [file exists $new] new_entries $new_entries staging $staging \
+        staging_exists [file exists $staging] staging_entries $staging_entries]
+}
+
+# How the move rewrites the trash manifest, line by line in file order (pure,
+# no disk access). A ts|orig|trash|batch line whose trash path is strictly
+# inside one of old_trashes as <batch>/<file> gets the same <batch>/<file>
+# under new_trash; a line already there (a move finished after a crash) is
+# kept byte for byte; anything else -- another folder, another depth, a line
+# that is not four fields -- is unmapped, and the move refuses while any
+# is. ts, orig and batch never change; no line is dropped or added.
+proc ::plugins::ShotHistoryEditor::_migrate_manifest_plan {lines old_trashes new_trash} {
+    set new_root [file normalize $new_trash]
+    set prefixes {}
+    foreach o $old_trashes { lappend prefixes "[file normalize $o]/" change }
+    lappend prefixes "$new_root/" keep
+    set out {} ; set unmapped {} ; set changed 0 ; set kept 0
+    foreach line $lines {
+        set parts [split $line "|"]
+        if {[llength $parts] != 4} { lappend unmapped $line ; continue }
+        lassign $parts ts orig trash batch
+        set t [file normalize $trash]
+        set mode ""
+        foreach {prefix m} $prefixes {
+            if {[string first $prefix $t] == 0} {
+                set rel [file split [string range $t [string length $prefix] end]]
+                if {[llength $rel] == 2} { set mode $m }
+                break
+            }
+        }
+        switch -- $mode {
+            change {
+                lappend out "$ts|$orig|[file join $new_root {*}$rel]|$batch"
+                incr changed
+            }
+            keep {
+                lappend out $line
+                incr kept
+            }
+            default { lappend unmapped $line }
+        }
+    }
+    return [dict create lines $out changed $changed kept $kept unmapped $unmapped]
+}
+
+# Files, bytes, folders and empty folders under dir (read-only; a folder
+# that cannot be listed is counted, not entered). v0.22.0: names are
+# de-duplicated -- on Windows `*` also matches dot-files, so `* .*` listed
+# them twice (the tablet's `*` skips them).
+proc ::plugins::ShotHistoryEditor::_tree_stats {dir} {
+    set files 0 ; set bytes 0 ; set dirs 0 ; set empty 0
+    if {![file isdirectory $dir] || ![file readable $dir]} {
+        return [dict create files 0 bytes 0 dirs 0 empty_dirs 0]
+    }
+    set stack [list $dir]
+    while {[llength $stack]} {
+        set d [lindex $stack end]
+        set stack [lrange $stack 0 end-1]
+        set kids [lsort -unique [lsearch -all -inline -not -regexp [glob -nocomplain -directory $d -tails * .*] {^\.\.?$}]]
+        if {$d ne $dir && [llength $kids] == 0} { incr empty }
+        foreach k $kids {
+            set p [file join $d $k]
+            if {[file isdirectory $p]} {
+                incr dirs
+                if {[file readable $p]} { lappend stack $p }
+            } elseif {[file isfile $p]} {
+                incr files
+                incr bytes [file size $p]
+            }
+        }
+    }
+    return [dict create files $files bytes $bytes dirs $dirs empty_dirs $empty]
+}
+
+proc ::plugins::ShotHistoryEditor::_line_count {path} {
+    if {![file isfile $path] || ![file readable $path]} { return "" }
+    set n 0
+    set fh [open $path r]
+    while {[gets $fh line] >= 0} { if {[string trim $line] ne ""} { incr n } }
+    close $fh
+    return $n
+}
+
+# The storage device a path is on ("" when it does not exist).
+proc ::plugins::ShotHistoryEditor::_she_dev {path} {
+    if {![file exists $path]} { return "" }
+    file stat $path st
+    return $st(dev)
+}
+
+# The move's own order: folders first, delete_log.txt last.
+proc ::plugins::ShotHistoryEditor::_she_move_order {names} {
+    set out {}
+    foreach e {trash backups trash_manifest.txt reconcile_manifest.txt edit_manifest.txt
+               edit_log.txt purge_log.txt delete_log.txt} {
+        if {$e in $names} { lappend out $e }
+    }
+    return $out
+}
+
+# Everything the move would do and every reason it would refuse, read-only.
+# Used by the Move page, its confirmation and perform_she_move itself, so
+# what is shown is what runs. can: 1 when nothing refuses.
+proc ::plugins::ShotHistoryEditor::_she_move_plan {} {
+    set lay [_she_layout]
+    set state [dict get $lay state]
+    set src [dict get $lay from]
+    set new [dict get $lay new]
+    set staging [dict get $lay staging]
+    set staged [dict get $lay staging_entries]
+    set to_move {}
+    if {$src ne ""} { set to_move [_she_move_order [_she_entries_in $src]] }
+    set all [_she_move_order [lsort -unique [concat $to_move $staged]]]
+    # The trash manifest, wherever it is now, and how its lines would map.
+    set mf ""
+    foreach r [list $staging $src] {
+        if {$r ne "" && [file isfile [file join $r trash_manifest.txt]]} { set mf [file join $r trash_manifest.txt] ; break }
+    }
+    set lines {}
+    set read_err ""
+    if {$mf ne ""} {
+        set rd [_manifest_read $mf 1]
+        set lines [dict get $rd lines]
+        set read_err [dict get $rd err]
+    }
+    set olds {}
+    if {$src ne ""} {
+        lappend olds [file join $src trash]
+    } else {
+        foreach r [_she_legacy_roots] { lappend olds [file join $r trash] }
+    }
+    set mplan [_migrate_manifest_plan $lines $olds [file join $new trash]]
+    set unmapped [llength [dict get $mplan unmapped]]
+    set overlap {}
+    foreach e $to_move { if {$e in $staged} { lappend overlap $e } }
+    # One device, so every step is a rename (CLAUDE.md: never copy-then-delete).
+    set root [_data_root]
+    set rdev [_she_dev $root]
+    set same_dev 1
+    set paths {}
+    if {$src ne ""} { lappend paths $src }
+    foreach e $to_move { lappend paths [file join $src $e] }
+    if {[file exists $staging]} { lappend paths $staging }
+    foreach p $paths { if {[_she_dev $p] ne $rdev} { set same_dev 0 } }
+    set unwritable {}
+    foreach p [concat [list $root] [lrange $paths 0 0]] { if {![file writable $p]} { lappend unwritable $p } }
+    if {[file exists $staging] && ![file writable $staging]} { lappend unwritable $staging }
+    set busy [_machine_busy]
+    set checks [list \
+        [file exists $new] "history_trash/ does not exist yet" "history_trash/ already exists" \
+        [expr {[llength $overlap] > 0}] "no item is in two places" "[join $overlap {, }] in both the plugin folder and history_trash.moving" \
+        [expr {$state eq "conflict"}] "SHE files are in one place" "more than one folder holds SHE files" \
+        [expr {$read_err ne ""}] "the trash manifest reads" "the trash manifest cannot be read ($read_err)" \
+        [expr {$unmapped > 0}] "every trash manifest line can be rewritten" "$unmapped trash manifest line(s) cannot be rewritten (another folder, another depth, or not ts|orig|trash|batch)" \
+        [expr {!$same_dev}] "one storage device, so each step is a rename" "the folders are on different storage devices: the move never copies" \
+        [expr {[llength $unwritable] > 0}] "the folders can be written" "cannot be written: [join $unwritable {, }]" \
+        [expr {$busy ne ""}] "the machine is idle" "the machine is busy ($busy)" \
+        [_sdb_busy] "SDB is not syncing" "SDB is syncing"]
+    set refusals {}
+    switch -- $state {
+        fresh { lappend refusals [translate "there is nothing to move"] }
+        moved { lappend refusals [translate "already moved"] }
+    }
+    foreach {bad ok_text bad_text} $checks { if {$bad} { lappend refusals $bad_text } }
+    return [dict create lay $lay state $state src $src new $new staging $staging staged $staged \
+        to_move $to_move all $all count [llength $all] manifest $mf lines $lines olds $olds mplan $mplan \
+        checks $checks refusals $refusals can [expr {[llength $refusals] == 0}]]
+}
+
+# What the confirmation is typed for; the move refuses if it changed.
+proc ::plugins::ShotHistoryEditor::_she_move_snap {plan} {
+    return [list [dict get $plan state] [dict get $plan src] [dict get $plan to_move] \
+        [dict get $plan staged] [llength [dict get $plan lines]]]
+}
+
+# The Move page's text (Advanced > Move trash and logs...), read-only, from
+# _she_move_plan. Lines stay short: the shared pager counts lines, not
+# wrapped rows.
+proc ::plugins::ShotHistoryEditor::migrate_preview_text {} {
+    set plan [_she_move_plan]
+    set lay [dict get $plan lay]
+    set state [dict get $plan state]
+    set src [dict get $plan src]
+    set new [dict get $plan new]
+    switch -- $state {
+        legacy     { set from $src }
+        unfinished { set from "[dict get $plan staging] (unfinished)[_pick [expr {$src ne {}}] " and $src" {}]" }
+        moved      { set from "nothing: already moved" }
+        conflict   { set from "more than one folder (below)" }
+        default    { set from "nothing: no SHE files yet" }
+    }
+    set lines [list \
+        "Nothing moves until you tap Move now... and type the number on the next page. Each item is renamed" \
+        "once into history_trash/; nothing is deleted (only the manifest is copied); history/ and history_v2/ stay." \
+        "" \
+        "From: $from" \
+        "To: $new" \
+        ""]
+    switch -- $state {
+        fresh { lappend lines "SHE has no trash, backups or logs yet: a new install keeps them in history_trash/ from the start." }
+        moved { lappend lines "Already moved: [join [dict get $lay new_entries] {, }] are in history_trash/. SHE uses that folder." }
+        unfinished {
+            lappend lines "A move stopped part way: [join [dict get $plan staged] {, }] wait in history_trash.moving."
+            lappend lines "Nothing can be deleted, restored or saved until it is finished: tap Finish move..."
+        }
+        conflict {
+            lappend lines "More than one folder holds SHE files, so nothing is written until only one does:"
+            foreach h [dict get $lay holders] { lappend lines "  $h: [join [_she_entries_in $h] {, }]" }
+            if {[llength [dict get $lay new_entries]]} { lappend lines "  $new: [join [dict get $lay new_entries] {, }]" }
+        }
+    }
+    if {$state in {legacy unfinished}} {
+        set base [_pick [expr {$src ne {}}] $src [dict get $plan staging]]
+        set tstats [_tree_stats [file join $base trash]]
+        set bstats [_tree_stats [file join $base backups]]
+        set mlines [dict get $plan lines]
+        set batches [lsort -unique [lmap l $mlines { lindex [split $l |] 3 }]]
+        set mp [dict get $plan mplan]
+        set unmapped [llength [dict get $mp unmapped]]
+        lappend lines "What moves ([dict get $plan count] of 8 items here):"
+        lappend lines "  trash/: [llength $batches] batch(es), [dict get $tstats files] file(s), [_fmt_bytes [dict get $tstats bytes]]; [dict get $tstats dirs] folder(s), [dict get $tstats empty_dirs] of them empty"
+        lappend lines "  backups/: [dict get $bstats dirs] folder(s), [dict get $bstats files] file(s), [_fmt_bytes [dict get $bstats bytes]]"
+        if {[dict get $plan manifest] eq ""} {
+            lappend lines "  trash_manifest.txt: not there yet"
+        } elseif {$unmapped == 0} {
+            lappend lines "  trash_manifest.txt: [llength $mlines] line(s); [dict get $mp changed] re-pointed to history_trash/trash/, [dict get $mp kept] already there"
+        } else {
+            lappend lines "  trash_manifest.txt: [llength $mlines] line(s); $unmapped cannot be rewritten, so the move refuses"
+        }
+        foreach {f note} {
+            delete_log.txt {moved as is, plus MIGRATE lines}
+            purge_log.txt {moved as is}
+            reconcile_manifest.txt {moved as is}
+            edit_manifest.txt {moved as is; the backup paths in it are only shown, never used}
+            edit_log.txt {moved as is}
+        } {
+            set p [file join $base $f]
+            if {![file exists $p] && $src ne "" && [file exists [file join [dict get $plan staging] $f]]} { set p [file join [dict get $plan staging] $f] }
+            set c [_line_count $p]
+            if {$c eq ""} {
+                lappend lines "  $f: not there yet (it starts in history_trash/)"
+            } else {
+                lappend lines "  $f: $c line(s), $note"
+            }
+        }
+        lappend lines "Stays in the plugin folder: its code, its docs and settings.tdb (the app keeps the theme there)."
+    }
+    lappend lines ""
+    lappend lines "The move refuses while any of these holds (it checks them again when it runs):"
+    foreach {bad ok_text bad_text} [dict get $plan checks] {
+        if {$bad} { lappend lines "  WOULD REFUSE NOW: $bad_text" } else { lappend lines "  ok: $ok_text" }
+    }
+    lappend lines ""
+    lappend lines "SHE uses [_she_data_dir] now. After the move an older SHE version would show an empty trash."
+    return [join $lines "\n"]
+}
+
+# The move's audit log: delete_log.txt wherever it is now (staging first),
+# else a new one in the folder that is moving.
+proc ::plugins::ShotHistoryEditor::_she_move_log_path {plan} {
+    set staging [dict get $plan staging]
+    set src [dict get $plan src]
+    foreach r [list $staging $src] {
+        if {$r ne "" && [file isfile [file join $r delete_log.txt]]} { return [file join $r delete_log.txt] }
+    }
+    if {$src ne ""} { return [file join $src delete_log.txt] }
+    return [file join $staging delete_log.txt]
+}
+
+# ---------------------------------------------------------------------------
+# v0.22.0 -- the one-time move (WRITE CAPABILITY 9; CLAUDE.md one-time-move
+# rule, 2026-10-21). Moves SHE's OWN 8 items from the plugin folder to
+# <data root>/history_trash/ by `file rename` only, on one storage device,
+# after a typed count. history/ and history_v2/ are never touched; nothing is
+# copied except the trash manifest's audit copy; nothing is deleted.
+#   1  MIGRATE BEGIN in delete_log.txt (write-ahead: if it cannot be written,
+#      nothing moves)
+#   2  file mkdir history_trash.moving (an empty one is reused)
+#   3  each item: file rename <plugin folder>/<item> -> history_trash.moving/
+#   4  trash_manifest.txt: file copy to trash_manifest.before_move.txt (once),
+#      the re-pointed lines written to trash_manifest.txt.new, read back,
+#      file rename over trash_manifest.txt (v0.23.2: not when no line is
+#      left to re-point)
+#   5  commit: file rename history_trash.moving -> history_trash
+#   6  MIGRATE OK + one MIGRATE ITEM line per item
+# A step that fails rolls back what this run did (items renamed back, the
+# manifest renamed back from its copy) and logs MIGRATE FAILED. A crash in
+# between leaves state "unfinished": every write is refused until the same
+# page finishes the move (steps 1-6 again: roll forward only; lines already
+# re-pointed are kept, so no record is lost or doubled).
+# ---------------------------------------------------------------------------
+
+# v0.23.1: when the re-pointed manifest cannot be put back from its copy,
+# nothing else moves back either: the items stay in the staging folder WITH
+# that manifest (state unfinished), and Finish move... completes the move --
+# never a re-pointed manifest back in the plugin folder.
+proc ::plugins::ShotHistoryEditor::_she_move_rollback {src staging moved manifest_done} {
+    set problems {}
+    set bm [file join $staging trash_manifest.before_move.txt]
+    set mf [file join $staging trash_manifest.txt]
+    if {$manifest_done} {
+        if {[catch { file rename -force -- $bm $mf } err]} {
+            msg -ERROR "ShotHistoryEditor: the move's trash_manifest.txt could not be put back from its copy: $err"
+            return [list "trash_manifest.txt could not be put back from its copy ($err), so every item stays in $staging with it"]
+        }
+    }
+    foreach e [lreverse $moved] {
+        set a [file join $staging $e] ; set b [file join $src $e]
+        if {[file exists $b]} { lappend problems "$e: $b exists, left in $staging" ; continue }
+        if {[catch { file rename -- $a $b } err]} { lappend problems "$e: not put back: $err" }
+    }
+    return $problems
+}
+
+# The one place that moves SHE's files. snap: _she_move_snap of the plan the
+# count was typed for. Returns ok, message, moved items, rollback problems.
+proc ::plugins::ShotHistoryEditor::perform_she_move {snap} {
+    set res [dict create ok 0 message "" items {} new "" problems {} log_ok 1 changed 0 kept 0 audit none]
+    set plan [_she_move_plan]
+    if {![dict get $plan can]} {
+        dict set res message "[translate {Not moved}]: [join [dict get $plan refusals] {; }]."
+        return $res
+    }
+    if {[_she_move_snap $plan] ne $snap} {
+        dict set res message [translate "Not moved: the folders changed since the confirmation opened. Open it again."]
+        return $res
+    }
+    set ts [clock format [clock seconds] -format {%Y%m%dT%H%M%S}]
+    set src [dict get $plan src]
+    set staging [dict get $plan staging]
+    set new [dict get $plan new]
+    dict set res new $new
+    # v0.23.1: the manifest's bytes before anything moves, for the check
+    # after a rollback; unreadable = nothing moves.
+    set pre_mf [dict get $plan manifest]
+    set pre_bytes ""
+    if {$pre_mf ne "" && [catch { set pre_bytes [_read_bytes $pre_mf] } err]} {
+        dict set res message "[translate {Not moved}]: [translate {the trash manifest cannot be read}] ($err)."
+        return $res
+    }
+    # 1. write-ahead
+    set blog [_she_move_log_path $plan]
+    set begin "$ts MIGRATE BEGIN from=$src to=$new items=[join [dict get $plan all] ,] staged=[join [dict get $plan staged] ,] manifest_lines=[llength [dict get $plan lines]]"
+    if {![_she_append $blog $begin]} {
+        dict set res message "[translate {Not moved}]: [translate {the MIGRATE BEGIN line could not be written to}] $blog."
+        return $res
+    }
+    msg -NOTICE "ShotHistoryEditor: $begin"
+    # The BEGIN line may have created delete_log.txt in the plugin folder.
+    set to_move {}
+    if {$src ne ""} { set to_move [_she_move_order [_she_entries_in $src]] }
+    set moved {}
+    set manifest_done 0
+    set step "" ; set item "" ; set err ""
+    # 2. the staging folder
+    if {![file isdirectory $staging] && [catch { file mkdir $staging } err]} {
+        set step mkdir
+    }
+    # 3. one rename per item
+    if {$step eq ""} {
+        foreach e $to_move {
+            set a [file join $src $e] ; set b [file join $staging $e]
+            if {[file exists $b]} { set step rename ; set item $e ; set err "already in $staging" ; break }
+            if {[catch { file rename -- $a $b } err]} { set step rename ; set item $e ; break }
+            lappend moved $e
+        }
+    }
+    # 4. the trash manifest, re-pointed in place
+    set mf [file join $staging trash_manifest.txt]
+    if {$step eq "" && [file isfile $mf]} {
+        set bm [file join $staging trash_manifest.before_move.txt]
+        set tmp "$mf.new"
+        # v0.23.1: re-read all of it or stop -- a short read would write a
+        # short manifest -- and it must be the plan's own line count.
+        set rd [_manifest_read $mf 1]
+        set mp [_migrate_manifest_plan [dict get $rd lines] [dict get $plan olds] [file join $new trash]]
+        dict set res changed [dict get $mp changed]
+        dict set res kept [dict get $mp kept]
+        set seen [expr {[dict get $mp changed] + [dict get $mp kept] + [llength [dict get $mp unmapped]]}]
+        set want ""
+        if {[llength [dict get $mp lines]]} { set want "[join [dict get $mp lines] \n]\n" }
+        # The audit copy is this run's own copy of a manifest nothing has
+        # re-pointed yet (a copy left by an earlier stopped attempt may be
+        # older). Once lines are re-pointed, the copy made just before that
+        # is the original and is kept; writes are refused since.
+        # v0.23.2: a manifest with nothing left to re-point (a Finish move
+        # after the rewrite) is not written again, so a failed commit never
+        # rolls a copy back over it; and when lines are re-pointed but the
+        # copy is gone, the manifest as it is now becomes the copy (audit
+        # "remade") instead of stopping every Finish move for good.
+        set kept [dict get $mp kept]
+        set have_bm [file isfile $bm]
+        if {$kept == 0} { dict set res audit made } elseif {!$have_bm} { dict set res audit remade } else { dict set res audit kept }
+        if {![dict get $rd ok]} {
+            set step manifest-read ; set err [dict get $rd err]
+        } elseif {$seen != [llength [dict get $plan lines]]} {
+            set step manifest-count ; set err "it has $seen line(s), the confirmation [llength [dict get $plan lines]]"
+        } elseif {[llength [dict get $mp unmapped]]} {
+            set step manifest ; set err "[llength [dict get $mp unmapped]] line(s) cannot be rewritten"
+        } elseif {($kept == 0 || !$have_bm) && [catch { file copy -force -- $mf $bm } err]} {
+            set step manifest-copy
+        } elseif {[dict get $mp changed] == 0} {
+            # Nothing to re-point: the manifest stays byte for byte.
+        } elseif {[catch {
+            set fh [open $tmp w]
+            fconfigure $fh -encoding utf-8 -translation lf
+            puts -nonewline $fh $want
+            close $fh
+        } err]} {
+            if {[info exists fh]} { catch { close $fh } }
+            set step manifest-write
+        } elseif {[catch { _read_bytes $tmp } got] || $got ne [encoding convertto utf-8 $want]} {
+            set step manifest-check ; set err "the new manifest did not read back"
+        } elseif {[catch { file rename -force -- $tmp $mf } err]} {
+            set step manifest-rename
+        } else {
+            set manifest_done 1
+        }
+    }
+    # 5. commit
+    if {$step eq ""} {
+        if {[file exists $new]} {
+            set step commit ; set err "$new appeared"
+        } elseif {[catch { file rename -- $staging $new } err]} {
+            set step commit
+        }
+    }
+    if {$step ne ""} {
+        set problems [_she_move_rollback $src $staging $moved $manifest_done]
+        # v0.23.1: "put back as it was" is checked on the disk, not assumed:
+        # every item this run moved is back in the plugin folder, none is
+        # left in the staging folder, and a manifest that moved this run has
+        # its bytes from before the move.
+        if {[llength $problems] == 0} {
+            foreach e $moved {
+                if {![file exists [file join $src $e]] || [file exists [file join $staging $e]]} {
+                    lappend problems "$e is not back in $src"
+                }
+            }
+            if {"trash_manifest.txt" in $moved && [llength $problems] == 0} {
+                if {[catch { _read_bytes [file join $src trash_manifest.txt] } got] || $got ne $pre_bytes} {
+                    lappend problems "trash_manifest.txt is not as it was before the move"
+                }
+            }
+        }
+        dict set res problems $problems
+        set rb [_pick [llength $problems] "NOT fully: [join $problems {; }]" "yes"]
+        # The log path without trusting the folders (a failed step may leave
+        # them half way): wherever delete_log.txt is now.
+        set flog ""
+        foreach r [list $staging $src] {
+            if {$r ne "" && $flog eq "" && [file isfile [file join $r delete_log.txt]]} { set flog [file join $r delete_log.txt] }
+        }
+        if {$flog eq ""} { set flog [file join [_pick [expr {$src ne {}}] $src $staging] delete_log.txt] }
+        set flog_ok [_she_append $flog "$ts MIGRATE FAILED step=$step item=$item err=$err; rolled back: $rb"]
+        msg -ERROR "ShotHistoryEditor: the move stopped at $step $item: $err; rolled back: $rb"
+        if {[llength $problems]} {
+            dict set res message "[translate {Stopped at}] $step $item: $err. [translate {Not everything is as it was}]: [join $problems {; }]."
+            if {![catch { dict get [_she_layout] state } now] && $now eq "unfinished"} {
+                dict append res message " [translate {The move is unfinished: tap Finish move... on the Move page.}]"
+            } else {
+                dict append res message " [translate {Look at the Move page before trying again.}]"
+            }
+        } else {
+            dict set res message "[translate {Stopped at}] $step $item: $err. [translate {Everything was put back as it was (checked on the disk); nothing moved.}]"
+        }
+        if {!$flog_ok} {
+            dict append res message " [translate {The MIGRATE FAILED line could not be written to}] $flog; [translate {see the app log.}]"
+        }
+        return $res
+    }
+    # 6. audit
+    set lp [file join $new delete_log.txt]
+    set log_ok [_she_append $lp "$ts MIGRATE OK from=$src to=$new items=[llength [dict get $plan all]] manifest_repointed=[dict get $res changed] manifest_kept=[dict get $res kept] audit_copy=[dict get $res audit]"]
+    foreach e [dict get $plan all] {
+        if {![_she_append $lp "$ts MIGRATE ITEM $e -> [file join $new $e]"]} { set log_ok 0 }
+    }
+    msg -NOTICE "ShotHistoryEditor: moved [join [dict get $plan all] {, }] to $new"
+    return [dict merge $res [dict create ok 1 items [dict get $plan all] log_ok $log_ok]]
+}
+
+# The Move page's button: Move now... (legacy) or Finish move... (a stopped
+# move), enabled only when the plan has no refusal.
+proc ::plugins::ShotHistoryEditor::_refresh_migrate_now {page} {
+    set plan [_she_move_plan]
+    set lbl [_pick [expr {[dict get $plan state] eq "unfinished"}] [translate "Finish move..."] [translate "Move now..."]]
+    catch { dui item config $page migrate_now -label $lbl }
+    catch { dui item enable_or_disable [dict get $plan can] $page migrate_now* -initial 1 }
+}
+
+proc ::plugins::ShotHistoryEditor::open_migrate_confirm {} {
+    if {![dict get [_she_move_plan] can]} { return }
+    open_page ShotHistoryEditor_migrate_confirm
+}
+
+proc ::plugins::ShotHistoryEditor::cancel_migrate_confirm {} {
+    _return_to_page ShotHistoryEditor_migrate_preview
+}
+
+# fresh 1 (the page's show): take the plan the count is typed for.
+proc ::plugins::ShotHistoryEditor::refresh_migrate_confirm_page {page {fresh 0}} {
+    variable migrate_snap
+    variable migrate_count
+    variable migrate_input
+    variable migrate_error
+    set plan [_she_move_plan]
+    if {$fresh} {
+        set migrate_snap [_she_move_snap $plan]
+        set migrate_count [dict get $plan count]
+        set migrate_input ""
+        set migrate_error ""
+    }
+    if {[dict get $plan can]} {
+        set from [_pick [expr {[dict get $plan src] ne {}}] [dict get $plan src] [dict get $plan staging]]
+        set instr "Type $migrate_count (the number of items that end up in history_trash/), then tap Move."
+        set mp [dict get $plan mplan]
+        set summary [join [list \
+            "From: $from" \
+            "To: [dict get $plan new]" \
+            "Items: [join [dict get $plan all] {, }]" \
+            "The trash manifest's [llength [dict get $plan lines]] line(s) point at the new trash/ afterwards ([dict get $mp changed] re-pointed, [dict get $mp kept] already there); a copy of it is kept as trash_manifest.before_move.txt." \
+            "history/ and history_v2/ are not touched. Nothing is deleted; the only copy made is that manifest copy. delete_log.txt records the move (MIGRATE lines)."] "\n"]
+    } else {
+        # The first reason only (the entry label sits two rows below); the
+        # Move page lists them all.
+        set instr "The move cannot run now: [lindex [dict get $plan refusals] 0]. Back to the Move page for the rest."
+        set summary ""
+    }
+    catch { dui item config $page migrate_instructions -text $instr }
+    catch { dui item config $page migrate_error_text -text $migrate_error }
+    catch { dui item config $page migrate_summary -text $summary }
+    catch { dui item enable_or_disable [dict get $plan can] $page migrate_confirm_btn* -initial 1 }
+}
+
+# The one place that calls perform_she_move.
+proc ::plugins::ShotHistoryEditor::confirm_migrate_submit {} {
+    variable migrate_snap
+    variable migrate_count
+    variable migrate_input
+    variable migrate_error
+    variable migrate_result_text
+    set typed [string trim $migrate_input]
+    if {$migrate_count eq "" || $typed ne $migrate_count} {
+        set migrate_error "Type exactly \"$migrate_count\" to confirm. Nothing was moved."
+        refresh_migrate_confirm_page ShotHistoryEditor_migrate_confirm
+        return
+    }
+    set r [perform_she_move $migrate_snap]
+    set lines {}
+    if {[dict get $r ok]} {
+        lappend lines "Moved. The plugin's trash, backups and logs are now in [dict get $r new]:"
+        lappend lines "  [join [dict get $r items] {, }]"
+        switch -- [dict get $r audit] {
+            remade { lappend lines "The trash manifest points at the new trash/ ([dict get $r changed] line(s) re-pointed). trash_manifest.before_move.txt was missing; it was made again from the manifest as it was (already re-pointed)." }
+            none   { lappend lines "There was no trash manifest to re-point." }
+            default { lappend lines "The trash manifest points at the new trash/ ([dict get $r changed] line(s) re-pointed); its original is trash_manifest.before_move.txt." }
+        }
+        lappend lines "Nothing was deleted (the only copy made is that manifest copy); history/ and history_v2/ were not touched."
+        if {![dict get $r log_ok]} { lappend lines "WARNING: a MIGRATE line could not be written to delete_log.txt; see the app log." }
+        lappend lines ""
+        lappend lines "Trash / Restore, Empty trash, Tidy, Reconcile and every save use the new folder from now on."
+    } else {
+        lappend lines [dict get $r message]
+    }
+    set migrate_result_text [join $lines "\n"]
+    set migrate_snap ""
+    open_page ShotHistoryEditor_migrate_result
+}
+
+# Appends one line (creating SHE's folder first if needed); 1 when it is on
+# disk, 0 (logged -ERROR) when not. Every trash-record append uses it, so a
+# failed one is never silent.
+proc ::plugins::ShotHistoryEditor::_she_append {path line} {
+    if {[catch {
+        set dir [file dirname $path]
+        if {![file isdirectory $dir]} { file mkdir $dir }
+        set fh [open $path a]
+        fconfigure $fh -encoding utf-8
+        puts $fh $line
+        close $fh
+    } err]} {
+        if {[info exists fh]} { catch { close $fh } }
+        msg -ERROR "ShotHistoryEditor: could not append to $path: $err"
+        return 0
+    }
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -1044,15 +1865,15 @@ proc ::plugins::ShotHistoryEditor::history_v2_path {} {
 # ---------------------------------------------------------------------------
 
 proc ::plugins::ShotHistoryEditor::trash_dir {} {
-    return [file join [_plugins_dir] ShotHistoryEditor trash]
+    return [_she_entry_path trash]
 }
 
 proc ::plugins::ShotHistoryEditor::trash_manifest_path {} {
-    return [file join [_plugins_dir] ShotHistoryEditor trash_manifest.txt]
+    return [_she_entry_path trash_manifest.txt]
 }
 
 proc ::plugins::ShotHistoryEditor::delete_log_path {} {
-    return [file join [_plugins_dir] ShotHistoryEditor delete_log.txt]
+    return [_she_entry_path delete_log.txt]
 }
 
 # Filenames here always originate from SDB's own `filename` column (never
@@ -1091,14 +1912,14 @@ proc ::plugins::ShotHistoryEditor::_new_batch_id {} {
 #    depth properly (_settings_block_bounds/_find_settings_key_line) to find
 #    the block's true end and the exact target key's line, instead of
 #    reusing the existing (unmodified, still fine for reading) parser.
-# b) plugins/SDB/SDB.tcl:2948 calls a core app proc `modify_shot_file $path
-#    new_settings` (via `get_shot_file_path`) to edit categories in a .shot
-#    file -- proving the app itself considers targeted .shot-file edits a
-#    normal, supported operation. Neither proc's implementation exists
-#    anywhere in this workspace, and SDB's call site immediately follows it
-#    with `db eval "UPDATE ..."` against SDB in the same breath (SDB.tcl:
-#    2954-2973), which this plugin must never do -- so, per "do not guess
-#    the DE1app plugin API", this pass does not call modify_shot_file and
+# b) plugins/SDB/SDB.tcl:2948 calls `modify_shot_file $path new_settings`
+#    (via `get_shot_file_path`) to edit categories in a .shot file --
+#    proving targeted .shot-file edits are a normal, supported operation.
+#    (v0.20.0 correction: both are SDB's own procs, ::plugins::SDB::
+#    modify_shot_file at SDB.tcl:1248 and get_shot_file_path at :1024, not
+#    core procs.) SDB's call site follows it with `db eval "UPDATE ..."`
+#    against SDB in the same breath (SDB.tcl:2954-2973), which this plugin
+#    must never do -- so this pass does not call modify_shot_file and
 #    instead implements its own self-contained, verified read-modify-
 #    temp-write-rename cycle below, touching only the one targeted
 #    settings{} line and nothing else in the file.
@@ -1121,15 +1942,15 @@ proc ::plugins::ShotHistoryEditor::_new_batch_id {} {
 # ---------------------------------------------------------------------------
 
 proc ::plugins::ShotHistoryEditor::backups_dir {} {
-    return [file join [_plugins_dir] ShotHistoryEditor backups]
+    return [_she_entry_path backups]
 }
 
 proc ::plugins::ShotHistoryEditor::edit_manifest_path {} {
-    return [file join [_plugins_dir] ShotHistoryEditor edit_manifest.txt]
+    return [_she_entry_path edit_manifest.txt]
 }
 
 proc ::plugins::ShotHistoryEditor::edit_log_path {} {
-    return [file join [_plugins_dir] ShotHistoryEditor edit_log.txt]
+    return [_she_entry_path edit_log.txt]
 }
 
 # Tcl-list-safe quoting for a single value being written back into a
@@ -1190,22 +2011,15 @@ proc ::plugins::ShotHistoryEditor::_find_settings_key_line {lines start end key}
     return $found
 }
 
+# v0.23.1: through _she_append (a failed line is logged -ERROR, never
+# swallowed); 1 when the line is on disk.
 proc ::plugins::ShotHistoryEditor::_append_edit_manifest {ts filename field old_value new_value backup_path} {
-    catch {
-        set fh [open [edit_manifest_path] a]
-        fconfigure $fh -encoding utf-8
-        puts $fh "$ts|$filename|$field|$old_value|$new_value|$backup_path"
-        close $fh
-    }
+    return [_she_append [edit_manifest_path] "$ts|$filename|$field|$old_value|$new_value|$backup_path"]
 }
 
 proc ::plugins::ShotHistoryEditor::_append_edit_log {ts filename field old_value new_value backup_path status} {
-    catch {
-        set fh [open [edit_log_path] a]
-        fconfigure $fh -encoding utf-8
-        puts $fh "$ts EDIT $status filename=$filename field=$field old=[_display $old_value] new=[_display $new_value] backup=$backup_path"
-        close $fh
-    }
+    return [_she_append [edit_log_path] \
+        "$ts EDIT $status filename=$filename field=$field old=[_display $old_value] new=[_display $new_value] backup=$backup_path"]
 }
 
 proc ::plugins::ShotHistoryEditor::_edit_manifest_lines {} {
@@ -1375,9 +2189,31 @@ proc ::plugins::ShotHistoryEditor::perform_metadata_edit {filename field new_val
     variable editable_fields
 
     set new_value [string trim $new_value]
+    # v0.22.0: its backup and logs go to SHE's folder, so not while that
+    # folder is being moved or is in two places.
+    set why [_she_write_blocker]
+    if {$why ne ""} {
+        return [dict create ok 0 message "Not saved: $why." old_value "" new_value $new_value backup_path ""]
+    }
     if {$new_value eq ""} {
         return [dict create ok 0 message "New value is empty; nothing was written." \
             old_value "" new_value "" backup_path ""]
+    }
+    # v0.23.0: the bag Save's own rules (final-check review). A brace or a
+    # backslash breaks the plugin's line readers for that file; a save while
+    # the DE1 runs or SDB syncs races the app's own writers.
+    set vp [_bag_value_problem $field $new_value]
+    if {$vp ne ""} {
+        return [dict create ok 0 message "Not saved: $field $vp." old_value "" new_value $new_value backup_path ""]
+    }
+    set busy [_machine_busy]
+    if {$busy ne ""} {
+        return [dict create ok 0 message "Not saved: the machine is busy ($busy); save when it is idle." \
+            old_value "" new_value $new_value backup_path ""]
+    }
+    if {[_sdb_busy]} {
+        return [dict create ok 0 message "Not saved: SDB is syncing; try again in a moment." \
+            old_value "" new_value $new_value backup_path ""]
     }
     if {[lsearch -exact $editable_fields $field] < 0} {
         return [dict create ok 0 message "'$field' is not in the safe editable field list." \
@@ -1398,7 +2234,7 @@ proc ::plugins::ShotHistoryEditor::perform_metadata_edit {filename field new_val
         set raw [read $fh]
         close $fh
     } err]} {
-        catch { close $fh }
+        if {[info exists fh]} { catch { close $fh } }
         return [dict create ok 0 message "Could not read $path: $err" \
             old_value "" new_value $new_value backup_path ""]
     }
@@ -1442,6 +2278,13 @@ proc ::plugins::ShotHistoryEditor::perform_metadata_edit {filename field new_val
         return [dict create ok 0 message "Could not create backup: $err" \
             old_value $old_value new_value $new_value backup_path ""]
     }
+    # v0.23.2: the backup is checked byte for byte first, as the bag Save's
+    # are; a failed save below is put back from it and checked again.
+    set orig_bytes [_read_bytes_or_empty $path]
+    if {$orig_bytes eq "" || [_read_bytes_or_empty $backup_path] ne $orig_bytes} {
+        return [dict create ok 0 message "Could not create backup: the copy at $backup_path does not match the original; nothing was written." \
+            old_value $old_value new_value $new_value backup_path ""]
+    }
 
     set tmp_path "${path}.tmp${batch_id}"
     if {[catch {
@@ -1450,7 +2293,7 @@ proc ::plugins::ShotHistoryEditor::perform_metadata_edit {filename field new_val
         puts -nonewline $th $new_content
         close $th
     } err]} {
-        catch { close $th }
+        if {[info exists th]} { catch { close $th } }
         return [dict create ok 0 message "Could not write temp file: $err" \
             old_value $old_value new_value $new_value backup_path $backup_path]
     }
@@ -1471,11 +2314,19 @@ proc ::plugins::ShotHistoryEditor::perform_metadata_edit {filename field new_val
     set verify2 [_parse_settings_file $path]
     set verify2_val [_dget [_dget $verify2 values] $field]
     if {[dict get $verify2 status] ne "found" || $verify2_val ne $new_value} {
-        catch { file rename -force -- $backup_path $path }
-        _append_edit_log $ts $filename $field $old_value $new_value $backup_path \
-            "FAILED post-rename verification; automatically restored from backup"
+        # v0.23.2: copied back (the backup stays) and checked, never
+        # reported as restored when it was not.
+        set rs [_bag_restore $path $backup_path $orig_bytes "FAILED post-rename verification"]
+        if {[dict get $rs status] eq "restore_failed"} {
+            msg -ERROR "ShotHistoryEditor: $path did not verify after the save and could not be put back; the intact copy is $backup_path"
+            _append_edit_log $ts $filename $field $old_value $new_value $backup_path [dict get $rs reason]
+            return [dict create ok 0 \
+                message "Save did not verify after writing, and the original could NOT be put back. The intact copy is $backup_path: copy it over history/$filename.shot by hand." \
+                old_value $old_value new_value $new_value backup_path $backup_path]
+        }
+        _append_edit_log $ts $filename $field $old_value $new_value $backup_path "[dict get $rs reason] (checked)"
         return [dict create ok 0 \
-            message "Save did not verify after writing; the original was automatically restored from backup." \
+            message "Save did not verify after writing; the original was restored from its backup (checked byte for byte)." \
             old_value $old_value new_value $new_value backup_path $backup_path]
     }
 
@@ -1485,8 +2336,10 @@ proc ::plugins::ShotHistoryEditor::perform_metadata_edit {filename field new_val
     # 16:45:30 (grinder_setting 7.5 -> 8; the edit_log records it and the file
     # does contain 8). Its modification time was still 1787057093 = 16:44:53 --
     # the moment the app first WROTE the shot. `file rename` landed the
-    # replacement carrying the original's timestamp: Tcl's rename falls back
-    # to a copy on this storage, and Tcl's copy preserves file times.
+    # replacement carrying the original's timestamp. (v0.21.0: why is not
+    # known. It was not a copy fallback, as this note used to say: a
+    # 2026-10-21 probe showed renames on this storage keep the inode. The
+    # explicit stamp below is what fixed it.)
     #
     # That silently defeats every consumer that detects edits by mtime.
     # SDB re-reads a .shot only when `file mtime > file_modification_date`
@@ -1507,8 +2360,12 @@ proc ::plugins::ShotHistoryEditor::perform_metadata_edit {filename field new_val
         catch { msg -NOTICE "ShotHistoryEditor: could not stamp the modification time of $path: $err (SDB will not see this edit until it is resynced another way)" }
     }
 
-    _append_edit_manifest $ts $filename $field $old_value $new_value $backup_path
-    _append_edit_log $ts $filename $field $old_value $new_value $backup_path "OK"
+    set log_ok [_append_edit_manifest $ts $filename $field $old_value $new_value $backup_path]
+    if {![_append_edit_log $ts $filename $field $old_value $new_value $backup_path "OK"]} { set log_ok 0 }
+
+    # v0.24.0: the same field in history_v2/<f>.json (capability 10). Its
+    # result never undoes the .shot write above.
+    set v2 [_v2_save $ts $filename [list $field $new_value] $backup_dir]
 
     # v0.6.0: tell Grind Advisor, so the recommendation follows the correction
     # without anyone having to know that it should. v0.6.3 shared that with
@@ -1516,7 +2373,7 @@ proc ::plugins::ShotHistoryEditor::perform_metadata_edit {filename field new_val
     set note [_notify_downstream "the edit"]
 
     return [dict create ok 1 message "" old_value $old_value new_value $new_value \
-        backup_path $backup_path refresh_note $note]
+        backup_path $backup_path refresh_note $note log_ok $log_ok v2 $v2]
 }
 
 # SQL string-literal quoting (distinct from _q, which quotes identifiers).
@@ -1526,29 +2383,51 @@ proc ::plugins::ShotHistoryEditor::_qval {s} {
     return "'[string map {' ''} $s]'"
 }
 
-proc ::plugins::ShotHistoryEditor::_manifest_lines {} {
-    set path [trash_manifest_path]
-    if {![file isfile $path]} { return {} }
-    set lines {}
+# v0.23.1: the manifest's non-empty lines, or why it could not be read --
+# all of it or nothing, never a partial list (the move rewrites from it).
+# A missing file is an empty manifest -- except with must_exist 1
+# (v0.23.3: Restore, Empty trash and the move, which rewrite from what they
+# read): then a file that is not there, or a stat that says so, is ok 0, so
+# a passing glitch can never make them write an empty manifest. Only the
+# delete path reads leniently (its own append-open has just created it).
+proc ::plugins::ShotHistoryEditor::_manifest_read {path {must_exist 0}} {
+    if {![file isfile $path]} {
+        if {$must_exist} {
+            msg -ERROR "ShotHistoryEditor: the trash manifest $path is not there (or cannot be seen)"
+            return [dict create ok 0 lines {} err "it is not there"]
+        }
+        return [dict create ok 1 lines {} err ""]
+    }
     if {[catch {
         set fh [open $path r]
         fconfigure $fh -encoding utf-8
-        while {[gets $fh line] >= 0} {
-            set line [string trim $line]
-            if {$line ne ""} { lappend lines $line }
-        }
+        set raw [read $fh]
         close $fh
-    }]} {
-        catch { close $fh }
+    } err]} {
+        if {[info exists fh]} { catch { close $fh } }
+        msg -ERROR "ShotHistoryEditor: could not read $path: $err"
+        return [dict create ok 0 lines {} err $err]
     }
-    return $lines
+    set lines {}
+    foreach line [split $raw "\n"] {
+        set line [string trim $line]
+        if {$line ne ""} { lappend lines $line }
+    }
+    return [dict create ok 1 lines $lines err ""]
+}
+
+# v0.21.0: path defaults to the live manifest; the move preview reads the
+# one in the folder it found. v0.23.1: a failed read is logged (-ERROR).
+proc ::plugins::ShotHistoryEditor::_manifest_lines {{path ""}} {
+    if {$path eq ""} { set path [trash_manifest_path] }
+    return [dict get [_manifest_read $path] lines]
 }
 
 # Manifest line format (one per moved FILE, not per shot):
 #   timestamp|original_path|trash_path|batch_id
-proc ::plugins::ShotHistoryEditor::_manifest_records {} {
+proc ::plugins::ShotHistoryEditor::_manifest_records {{path ""}} {
     set records {}
-    foreach line [_manifest_lines] {
+    foreach line [_manifest_lines $path] {
         set parts [split $line "|"]
         if {[llength $parts] != 4} { continue }
         lassign $parts ts orig trash batch
@@ -1557,48 +2436,106 @@ proc ::plugins::ShotHistoryEditor::_manifest_records {} {
     return $records
 }
 
-proc ::plugins::ShotHistoryEditor::_rewrite_manifest {records} {
+# v0.20.0: where a manifest record's file belongs on disk NOW. The manifest
+# keeps the absolute `orig` path written at delete time, so a batch trashed
+# under an older data root must come back under the current one: every disk
+# use of `orig` (restore_batch, _reconcile_records, perform_unhide) maps it by
+# name -- <name>.shot into [history_path], <name>.json into [history_v2_path].
+# Returns "" (the caller refuses the record) for any other extension, a name
+# that is not a plain file name, a trash copy of another name, or a result
+# that is not directly inside one of those two folders. The manifest and
+# reconcile key strings are never rewritten.
+proc ::plugins::ShotHistoryEditor::_rebased_orig {orig {trash ""}} {
+    set name [file tail $orig]
+    if {![_safe_filename $name] || [file rootname $name] eq ""} { return "" }
+    if {$trash ne "" && [file tail $trash] ne $name} { return "" }
+    switch -exact -- [file extension $name] {
+        .shot   { set folder [history_path] }
+        .json   { set folder [history_v2_path] }
+        default { return "" }
+    }
+    set target [file join $folder $name]
+    if {[file dirname [file normalize $target]] ne [file normalize $folder]} { return "" }
+    return $target
+}
+
+# v0.23.2: the one way the trash manifest is replaced (Restore, Empty trash,
+# and each delete's new lines): the whole new text to trash_manifest.txt.new,
+# read back byte for byte, then one rename over trash_manifest.txt. A
+# failure at any step leaves the manifest as it was (no truncated or
+# half-written manifest) and is logged -ERROR. Returns 1 or 0.
+proc ::plugins::ShotHistoryEditor::_manifest_write {lines} {
+    set mf [trash_manifest_path]
+    set tmp "$mf.new"
+    set want ""
+    if {[llength $lines]} { set want "[join $lines \n]\n" }
     if {[catch {
-        set fh [open [trash_manifest_path] w]
-        fconfigure $fh -encoding utf-8
-        foreach rec $records {
-            puts $fh "[dict get $rec ts]|[dict get $rec orig]|[dict get $rec trash]|[dict get $rec batch]"
-        }
+        set fh [open $tmp w]
+        fconfigure $fh -encoding utf-8 -translation lf
+        puts -nonewline $fh $want
         close $fh
     } err]} {
-        catch { close $fh }
+        if {[info exists fh]} { catch { close $fh } }
+        msg -ERROR "ShotHistoryEditor: could not write $tmp: $err"
+        return 0
+    }
+    if {[catch { _read_bytes $tmp } got] || $got ne [encoding convertto utf-8 $want]} {
+        msg -ERROR "ShotHistoryEditor: $tmp did not read back as written; $mf is unchanged"
+        return 0
+    }
+    if {[catch { file rename -force -- $tmp $mf } err]} {
+        msg -ERROR "ShotHistoryEditor: could not replace $mf: $err"
         return 0
     }
     return 1
 }
 
+# v0.22.0: no longer swallowed (final-check refuter: a lost manifest line
+# after the files moved loses the record of where they went). Returns
+# manifest_ok and log_ok; perform_delete_batch puts the files back when the
+# manifest line could not be written. v0.23.2: the lines go in through
+# _manifest_write (all of the batch or none: a partial append on a full
+# disk used to leave lines naming files that were then put back).
 proc ::plugins::ShotHistoryEditor::_append_manifest_and_log {moved batch_id ts shot_count} {
-    if {[llength $moved] == 0} { return }
-    catch {
-        set mh [open [trash_manifest_path] a]
-        fconfigure $mh -encoding utf-8
-        foreach m $moved {
-            lassign $m fn src dst
-            puts $mh "$ts|$src|$dst|$batch_id"
-        }
-        close $mh
+    if {[llength $moved] == 0} { return [dict create manifest_ok 1 log_ok 1] }
+    set lines {}
+    foreach m $moved {
+        lassign $m fn src dst
+        lappend lines "$ts|$src|$dst|$batch_id"
     }
-    catch {
-        set lh [open [delete_log_path] a]
-        fconfigure $lh -encoding utf-8
-        puts $lh "$ts DELETE batch=$batch_id shots=$shot_count files=[llength $moved] -> [trash_dir]/${ts}_${batch_id}"
-        close $lh
+    set rd [_manifest_read [trash_manifest_path]]
+    set manifest_ok 0
+    if {[dict get $rd ok]} { set manifest_ok [_manifest_write [concat [dict get $rd lines] $lines]] }
+    set log_ok 0
+    if {$manifest_ok} {
+        set log_ok [_she_append [delete_log_path] \
+            "$ts DELETE batch=$batch_id shots=$shot_count files=[llength $moved] -> [trash_dir]/${ts}_${batch_id}"]
     }
+    return [dict create manifest_ok $manifest_ok log_ok $log_ok]
 }
 
-proc ::plugins::ShotHistoryEditor::_append_restore_log {batch_id restored collisions} {
-    catch {
-        set lh [open [delete_log_path] a]
-        fconfigure $lh -encoding utf-8
-        set ts [clock format [clock seconds] -format {%Y%m%dT%H%M%S}]
-        puts $lh "$ts RESTORE batch=$batch_id restored_files=$restored collisions=$collisions"
-        close $lh
+# v0.22.0: the files of a batch whose manifest lines could not be written go
+# back where they came from (newest first, never over an existing file).
+# Returns the trash paths that could not be put back (reported, never lost).
+proc ::plugins::ShotHistoryEditor::_delete_put_back {moved} {
+    set stuck {}
+    foreach m [lreverse $moved] {
+        lassign $m fn src dst
+        if {[file exists $src]} {
+            msg -ERROR "ShotHistoryEditor: $dst not put back: $src exists"
+            lappend stuck $dst
+        } elseif {[catch { file rename -- $dst $src } err]} {
+            msg -ERROR "ShotHistoryEditor: $dst not put back to $src: $err"
+            lappend stuck $dst
+        }
     }
+    return $stuck
+}
+
+proc ::plugins::ShotHistoryEditor::_append_restore_log {batch_id restored collisions {refused 0} {manifest_ok 1} {failed 0}} {
+    set ts [clock format [clock seconds] -format {%Y%m%dT%H%M%S}]
+    return [_she_append [delete_log_path] \
+        "$ts RESTORE batch=$batch_id restored_files=$restored collisions=$collisions refused=$refused manifest_rewritten=$manifest_ok failed=$failed"]
 }
 
 # Base shot filenames (no extension) currently hidden because their .shot
@@ -1643,15 +2580,18 @@ proc ::plugins::ShotHistoryEditor::_reconcile_records {} {
     foreach rec [_manifest_records] {
         set orig [dict get $rec orig]
         if {![string match "*.shot" $orig]} { continue }
-        if {![file exists $orig]} { continue }
+        # v0.20.0: "on disk again" means in the CURRENT history folder; `orig`
+        # stays the manifest's own string (Unhide's key is built from it).
+        set disk [_rebased_orig $orig]
+        if {$disk eq "" || ![file exists $disk]} { continue }
         if {[dict exists $reconciled [_manifest_key $rec]]} { continue }
         set trash [dict get $rec trash]
         set trash_exists [file exists $trash]
         set disk_mtime ""
         set trash_mtime ""
-        catch { set disk_mtime [file mtime $orig] }
+        catch { set disk_mtime [file mtime $disk] }
         if {$trash_exists} { catch { set trash_mtime [file mtime $trash] } }
-        lappend out [dict create filename [file rootname [file tail $orig]] orig $orig \
+        lappend out [dict create filename [file rootname [file tail $orig]] orig $orig disk $disk \
             trash $trash trash_exists $trash_exists ts [dict get $rec ts] \
             batch [dict get $rec batch] disk_mtime $disk_mtime trash_mtime $trash_mtime]
     }
@@ -1709,7 +2649,7 @@ proc ::plugins::ShotHistoryEditor::_fmt_mtime {t} {
 # ---------------------------------------------------------------------------
 
 proc ::plugins::ShotHistoryEditor::reconcile_manifest_path {} {
-    return [file join [_plugins_dir] ShotHistoryEditor reconcile_manifest.txt]
+    return [_she_entry_path reconcile_manifest.txt]
 }
 
 proc ::plugins::ShotHistoryEditor::_manifest_key {rec} {
@@ -1737,17 +2677,15 @@ proc ::plugins::ShotHistoryEditor::_reconciled_keys_dict {} {
 }
 
 proc ::plugins::ShotHistoryEditor::_append_reconcile_log {now orig batch} {
-    catch {
-        set lh [open [delete_log_path] a]
-        fconfigure $lh -encoding utf-8
-        puts $lh "$now RECONCILE UNHIDE orig=$orig batch=$batch (trash entry kept, shot visible again)"
-        close $lh
-    }
+    return [_she_append [delete_log_path] \
+        "$now RECONCILE UNHIDE orig=$orig batch=$batch (trash entry kept, shot visible again)"]
 }
 
 # The one write of this capability. Refuses unless the manifest line still
 # exists, the file is really on disk, and it was not unhidden already.
 proc ::plugins::ShotHistoryEditor::perform_unhide {ts orig batch} {
+    set why [_she_write_blocker]
+    if {$why ne ""} { return [dict create ok 0 message "$why; nothing written."] }
     set key "$ts|$orig|$batch"
     set found 0
     foreach rec [_manifest_records] {
@@ -1756,7 +2694,12 @@ proc ::plugins::ShotHistoryEditor::perform_unhide {ts orig batch} {
     if {!$found} {
         return [dict create ok 0 message "that trash entry is no longer in the manifest; nothing written."]
     }
-    if {![file exists $orig]} {
+    # v0.20.0: the file is looked for in the current history folder.
+    set disk [_rebased_orig $orig]
+    if {$disk eq ""} {
+        return [dict create ok 0 message "[file tail $orig] is not a history shot file; nothing written."]
+    }
+    if {![file exists $disk]} {
         return [dict create ok 0 message "[file tail $orig] is not on disk any more; nothing written."]
     }
     if {[dict exists [_reconciled_keys_dict] $key]} {
@@ -1772,9 +2715,12 @@ proc ::plugins::ShotHistoryEditor::perform_unhide {ts orig batch} {
         if {[info exists fh]} { catch { close $fh } }
         return [dict create ok 0 message "could not write the reconcile manifest: $err"]
     }
-    _append_reconcile_log $now $orig $batch
+    set note ""
+    if {![_append_reconcile_log $now $orig $batch]} {
+        set note [translate "(its audit line could not be written to delete_log.txt; see the app log)"]
+    }
     msg -INFO "ShotHistoryEditor: unhid $orig (trash entry $ts/$batch kept)"
-    return [dict create ok 1 message ""]
+    return [dict create ok 1 message $note]
 }
 
 proc ::plugins::ShotHistoryEditor::scroll_reconcile {delta} {
@@ -1855,6 +2801,7 @@ proc ::plugins::ShotHistoryEditor::unhide_row {i} {
     set result [perform_unhide [dict get $r ts] [dict get $r orig] [dict get $r batch]]
     if {[dict get $result ok]} {
         set reconcile_note "Unhidden [dict get $r filename]: back in the card list and Source Inspector; its trash entry is unchanged."
+        if {[dict get $result message] ne ""} { append reconcile_note " " [dict get $result message] }
     } else {
         set reconcile_note "Not unhidden: [dict get $result message]"
     }
@@ -2031,7 +2978,8 @@ proc ::plugins::ShotHistoryEditor::empty_trash_preview_text {} {
 #      requires the typed batch count.
 #   2. perform_purge refuses if the batch set changed since the snapshot.
 #   3. For every trash-manifest line: the trash path must resolve STRICTLY
-#      inside plugins/ShotHistoryEditor/trash/ (else kept + logged), must be
+#      inside SHE's trash/ (plugins/ShotHistoryEditor/trash/, or history_trash/
+#      trash/ after the v0.22.0 move) (else kept + logged), must be
 #      a listed file (else "already gone", line dropped); then ONE
 #      `file delete` on that file. Then `file delete` on each batch folder
 #      only if it is now empty (non-empty folders stay).
@@ -2042,7 +2990,7 @@ proc ::plugins::ShotHistoryEditor::empty_trash_preview_text {} {
 # ---------------------------------------------------------------------------
 
 proc ::plugins::ShotHistoryEditor::purge_log_path {} {
-    return [file join [_plugins_dir] ShotHistoryEditor purge_log.txt]
+    return [_she_entry_path purge_log.txt]
 }
 
 # True only for a path strictly inside the plugin's own trash folder.
@@ -2054,16 +3002,20 @@ proc ::plugins::ShotHistoryEditor::_inside_trash_dir {path} {
                   [string equal -length [string length $prefix] $prefix $p]}]
 }
 
+# 1 when the line is on disk. v0.22.0: write-ahead -- a file gets its
+# "removing" line BEFORE it is deleted, and no line means no delete
+# (CLAUDE.md: every removed file has a purge_log.txt line).
 proc ::plugins::ShotHistoryEditor::_append_purge_line {ts rec bytes status} {
-    catch {
-        set fh [open [purge_log_path] a]
-        fconfigure $fh -encoding utf-8
-        puts $fh "$ts|[dict get $rec batch]|[dict get $rec orig]|[dict get $rec trash]|$bytes|$status"
-        close $fh
-    }
+    return [_she_append [purge_log_path] \
+        "$ts|[dict get $rec batch]|[dict get $rec orig]|[dict get $rec trash]|$bytes|$status"]
 }
 
 proc ::plugins::ShotHistoryEditor::perform_purge {expected_batch_ids} {
+    set why [_she_write_blocker]
+    if {$why ne ""} {
+        return [dict create ok 0 message "Nothing was removed: $why." \
+            batches 0 removed_files 0 bytes 0 skipped {} already_gone 0 manifest_ok 1 log_failed 0 log_ok 1]
+    }
     set ts [clock format [clock seconds] -format {%Y%m%dT%H%M%S}]
     set batches [_trash_batches]
     set ids [lsort [lmap b $batches { dict get $b batch_id }]]
@@ -2075,49 +3027,66 @@ proc ::plugins::ShotHistoryEditor::perform_purge {expected_batch_ids} {
         return [dict create ok 0 message "The trash is empty; nothing to remove." \
             batches 0 removed_files 0 bytes 0 skipped {} already_gone 0 manifest_ok 1]
     }
+    # v0.23.2: the manifest read whole or not at all -- a failed read used to
+    # look empty, and the rewrite below then emptied the manifest.
+    set rd [_manifest_read [trash_manifest_path] 1]
+    if {![dict get $rd ok]} {
+        return [dict create ok 0 message "The trash manifest cannot be read ([dict get $rd err]); nothing was removed." \
+            batches 0 removed_files 0 bytes 0 skipped {} already_gone 0 manifest_ok 1 log_failed 0 log_ok 1]
+    }
     set removed 0
     set bytes 0
     set already_gone 0
+    set log_failed 0
     set skipped {}
     set keep {}
-    foreach rec [_manifest_records] {
+    foreach line [dict get $rd lines] {
+        set parts [split $line "|"]
+        # A line that is not ts|orig|trash|batch names no file: kept as it is.
+        if {[llength $parts] != 4} { lappend keep $line ; continue }
+        lassign $parts lts lorig ltrash lbatch
+        set rec [dict create ts $lts orig $lorig trash $ltrash batch $lbatch]
         set t [dict get $rec trash]
         if {![_inside_trash_dir $t]} {
             lappend skipped [dict create path $t reason "outside the plugin trash folder"]
-            lappend keep $rec
-            _append_purge_line $ts $rec 0 "SKIPPED outside trash"
+            lappend keep $line
+            if {![_append_purge_line $ts $rec 0 "SKIPPED outside trash"]} { incr log_failed }
             continue
         }
         if {![file isfile $t]} {
             incr already_gone
-            _append_purge_line $ts $rec 0 "already gone"
+            if {![_append_purge_line $ts $rec 0 "already gone"]} { incr log_failed }
             continue
         }
         set sz 0
         catch { set sz [file size $t] }
+        # v0.22.0: write-ahead -- no purge_log line, no delete.
+        if {![_append_purge_line $ts $rec $sz "removing"]} {
+            lappend skipped [dict create path $t reason "kept: its purge_log.txt line could not be written"]
+            lappend keep $line
+            incr log_failed
+            continue
+        }
         if {[catch { file delete -- $t } err]} {   ;# purge-only (CLAUDE.md exception 2026-09-18)
             lappend skipped [dict create path $t reason "could not remove: $err"]
-            lappend keep $rec
-            _append_purge_line $ts $rec $sz "FAILED $err"
+            lappend keep $line
+            if {![_append_purge_line $ts $rec $sz "FAILED $err"]} { incr log_failed }
             continue
         }
         incr removed
         incr bytes $sz
-        _append_purge_line $ts $rec $sz "removed"
+        if {![_append_purge_line $ts $rec $sz "removed"]} { incr log_failed }
     }
     # v0.13.0: every empty folder directly under the trash goes, not only
     # the ones this purge emptied (earlier restores left theirs behind).
     set folders_removed [_remove_empty_trash_dirs]
-    set manifest_ok [_rewrite_manifest $keep]
-    catch {
-        set lh [open [delete_log_path] a]
-        fconfigure $lh -encoding utf-8
-        puts $lh "$ts PURGE batches=[llength $batches] files_removed=$removed bytes=$bytes folders_removed=$folders_removed already_gone=$already_gone skipped=[llength $skipped] manifest_rewritten=$manifest_ok (Empty trash)"
-        close $lh
-    }
+    set manifest_ok [_manifest_write $keep]
+    set log_ok [_she_append [delete_log_path] \
+        "$ts PURGE batches=[llength $batches] files_removed=$removed bytes=$bytes folders_removed=$folders_removed already_gone=$already_gone skipped=[llength $skipped] manifest_rewritten=$manifest_ok purge_log_failures=$log_failed (Empty trash)"]
     msg -NOTICE "ShotHistoryEditor: Empty trash removed $removed file(s), $bytes bytes, [llength $batches] batch(es), $folders_removed empty folder(s); skipped [llength $skipped]"
     return [dict create ok 1 message "" batches [llength $batches] removed_files $removed bytes $bytes \
-        skipped $skipped already_gone $already_gone manifest_ok $manifest_ok folders_removed $folders_removed]
+        skipped $skipped already_gone $already_gone manifest_ok $manifest_ok folders_removed $folders_removed \
+        log_failed $log_failed log_ok $log_ok]
 }
 
 # ---------------------------------------------------------------------------
@@ -2185,16 +3154,18 @@ proc ::plugins::ShotHistoryEditor::_refresh_tidy_btn {page} {
 # only, files and batches untouched; one audit line.
 proc ::plugins::ShotHistoryEditor::tidy_trash_folders {} {
     variable tidy_note
+    set why [_she_write_blocker]
+    if {$why ne ""} {
+        set tidy_note "Tidy did not run: $why."
+        refresh_trash_page ShotHistoryEditor_trash
+        return
+    }
     set n [_remove_empty_trash_dirs]
     set ts [clock format [clock seconds] -format {%Y%m%dT%H%M%S}]
-    catch {
-        set lh [open [delete_log_path] a]
-        fconfigure $lh -encoding utf-8
-        puts $lh "$ts TIDY removed $n empty trash folder(s)"
-        close $lh
-    }
+    set logged [_she_append [delete_log_path] "$ts TIDY removed $n empty trash folder(s)"]
     msg -INFO "ShotHistoryEditor: Tidy removed $n empty trash folder(s)"
     set tidy_note "Tidy: removed $n empty trash folder(s); files and batches untouched."
+    if {!$logged} { append tidy_note " (delete_log.txt could not be written; see the app log)" }
     refresh_trash_page ShotHistoryEditor_trash
 }
 
@@ -2208,6 +3179,10 @@ proc ::plugins::ShotHistoryEditor::refresh_advanced_page {page} {
     if {$r > 0} {
         append note [expr {$note eq "" ? "" : " "}] "$r of them exist on disk again - see Reconcile hidden shots."
     }
+    # v0.22.0: while SHE's own files are mid-move or in two places, every
+    # write is refused; say why where the tools are.
+    set why [_she_write_blocker]
+    if {$why ne ""} { set note "Nothing can be written now: $why." }
     catch { dui item config $page deleted_note -text $note }
 }
 
@@ -2261,6 +3236,9 @@ proc ::plugins::ShotHistoryEditor::confirm_purge_submit {} {
         if {![dict get $result manifest_ok]} {
             lappend lines "WARNING: the trash manifest could not be rewritten; see the log."
         }
+        if {[_dget $result log_failed 0] > 0 || ![_dget $result log_ok 1]} {
+            lappend lines "WARNING: [_dget $result log_failed 0] purge_log.txt line(s) and the delete_log summary ([_pick [_dget $result log_ok 1] written {NOT written}]) -- see the app log."
+        }
     } else {
         lappend lines "Not removed: [dict get $result message]"
     }
@@ -2295,14 +3273,36 @@ proc ::plugins::ShotHistoryEditor::close_purge_result {} {
 proc ::plugins::ShotHistoryEditor::perform_delete_batch {filenames} {
     set batch_id [_new_batch_id]
     set ts [clock format [clock seconds] -format {%Y%m%dT%H%M%S}]
+    set why [_she_write_blocker]
+    if {$why ne ""} {
+        return [dict create ok 0 message "Nothing was deleted: $why." \
+            moved_files 0 shot_count 0 failed {} batch_id $batch_id trash_path "" log_ok 1]
+    }
     set batch_dir [file join [trash_dir] "${ts}_${batch_id}"]
     set moved {}
     set failed {}
     set shot_count 0
 
     if {[catch { file mkdir $batch_dir } err]} {
-        return [dict create ok 0 message "Could not create trash folder: $err" \
-            moved_files 0 shot_count 0 failed $filenames batch_id $batch_id]
+        # v0.23.3: the same shape as every other return (the result page
+        # read trash_path and each failed entry's filename/reason, and threw).
+        msg -ERROR "ShotHistoryEditor: could not create the trash folder $batch_dir: $err"
+        return [dict create ok 0 message "Nothing was deleted: the trash folder could not be made ($err)." \
+            moved_files 0 shot_count 0 batch_id $batch_id trash_path $batch_dir log_ok 1 \
+            failed [lmap fn $filenames { dict create filename $fn reason "not moved: no trash folder" }]]
+    }
+    # v0.22.0: the manifest must take this batch's lines before anything
+    # moves (opening it to append creates it if needed and writes nothing).
+    if {[catch { close [open [trash_manifest_path] a] } err]} {
+        msg -ERROR "ShotHistoryEditor: the trash manifest cannot be written: $err"
+        return [dict create ok 0 message "Nothing was deleted: the trash manifest cannot be written ($err)." \
+            moved_files 0 shot_count 0 failed {} batch_id $batch_id trash_path $batch_dir log_ok 1]
+    }
+    # v0.23.2: and read whole, since the batch's lines are added to all of it.
+    set rd [_manifest_read [trash_manifest_path]]
+    if {![dict get $rd ok]} {
+        return [dict create ok 0 message "Nothing was deleted: the trash manifest cannot be read ([dict get $rd err])." \
+            moved_files 0 shot_count 0 failed {} batch_id $batch_id trash_path $batch_dir log_ok 1]
     }
 
     foreach fn $filenames {
@@ -2339,7 +3339,10 @@ proc ::plugins::ShotHistoryEditor::perform_delete_batch {filenames} {
             # Stop the whole batch here; keep whatever already succeeded.
             foreach pm $pair_moved { lappend moved $pm }
             lappend failed [dict create filename $fn reason "move failed: $move_err"]
-            _append_manifest_and_log $moved $batch_id $ts $shot_count
+            set logged [_append_manifest_and_log $moved $batch_id $ts $shot_count]
+            if {![dict get $logged manifest_ok]} {
+                return [_delete_unrecorded $moved $batch_id $batch_dir $shot_count $failed]
+            }
             # Some files DID move before the stop, so the history folder has
             # changed and the recommendation is stale even though this batch
             # failed. Refresh on exactly that condition (v0.6.3).
@@ -2349,14 +3352,17 @@ proc ::plugins::ShotHistoryEditor::perform_delete_batch {filenames} {
             }
             return [dict create ok 0 message "A file move failed partway through the batch; stopped." \
                 moved_files [llength $moved] shot_count $shot_count failed $failed batch_id $batch_id \
-                trash_path $batch_dir refresh_note $note]
+                trash_path $batch_dir refresh_note $note log_ok [dict get $logged log_ok]]
         }
 
         foreach pm $pair_moved { lappend moved $pm }
         incr shot_count
     }
 
-    _append_manifest_and_log $moved $batch_id $ts $shot_count
+    set logged [_append_manifest_and_log $moved $batch_id $ts $shot_count]
+    if {![dict get $logged manifest_ok]} {
+        return [_delete_unrecorded $moved $batch_id $batch_dir $shot_count $failed]
+    }
 
     # v0.6.3: the deleted shots must stop counting towards the grind
     # recommendation. Once per batch, after the manifest is written -- never
@@ -2367,39 +3373,117 @@ proc ::plugins::ShotHistoryEditor::perform_delete_batch {filenames} {
         set note [_notify_downstream "the delete"]
     }
     return [dict create ok 1 message "" moved_files [llength $moved] shot_count $shot_count \
-        failed $failed batch_id $batch_id trash_path $batch_dir refresh_note $note]
+        failed $failed batch_id $batch_id trash_path $batch_dir refresh_note $note \
+        log_ok [dict get $logged log_ok]]
+}
+
+# v0.22.0: the batch's files moved but its manifest lines could not be
+# written -- without them nothing would know where the files went, so they
+# go back to history/ (and history_v2/). Anything that cannot go back is
+# named on the result page and in the app log.
+proc ::plugins::ShotHistoryEditor::_delete_unrecorded {moved batch_id batch_dir shot_count failed} {
+    set stuck [_delete_put_back $moved]
+    set back [expr {[llength $moved] - [llength $stuck]}]
+    if {[llength $stuck]} {
+        msg -ERROR "ShotHistoryEditor: delete batch $batch_id: the trash manifest could not be written and [llength $stuck] file(s) could not be put back: [join $stuck {, }]"
+        set m "The trash manifest could not be written. $back file(s) went back to history/; [llength $stuck] could not and are still in $batch_dir: [join $stuck {, }]."
+    } else {
+        msg -ERROR "ShotHistoryEditor: delete batch $batch_id: the trash manifest could not be written; all $back file(s) were put back"
+        set m "The trash manifest could not be written, so nothing was deleted: all $back file(s) are back in history/."
+    }
+    # Only files that stayed out of history/ change what Grind Advisor sees.
+    if {[llength $stuck]} { _notify_downstream "a delete that could not be put back" }
+    return [dict create ok 0 message $m moved_files [llength $stuck] shot_count 0 failed $failed \
+        batch_id $batch_id trash_path $batch_dir refresh_note "" log_ok 0 put_back $back stuck $stuck]
 }
 
 # Moves every file in a trash batch back to its original path. Move only --
 # never overwrites. If the original path already has a file (name
 # collision), that file is skipped and left in the trash/manifest so it can
 # be retried later rather than silently lost.
+# v0.20.0: the target is the record's name in the CURRENT history folder
+# (_rebased_orig), never the stored absolute path, and the source must be
+# inside the plugin trash; a record failing either is kept and counted as
+# refused. Refused, collided and a failed manifest rewrite are reported on
+# the Trash page (note) and in delete_log's RESTORE line; refusals and a
+# failed rewrite also go to the app log (-NOTICE). v0.22.0: refused while a
+# move of SHE's files is unfinished or they are in two places; a RESTORE
+# line that cannot be written is named in the note.
 proc ::plugins::ShotHistoryEditor::restore_batch {batch_id} {
-    set records [_manifest_records]
+    set why [_she_write_blocker]
+    if {$why ne ""} {
+        return [dict create restored 0 collisions 0 refused 0 manifest_ok 1 refresh_note "" \
+            trash_note "Restore did not run: $why."]
+    }
+    # v0.23.2: the manifest read whole or not at all -- a failed read used to
+    # look empty, and the rewrite below then emptied the manifest.
+    set rd [_manifest_read [trash_manifest_path] 1]
+    if {![dict get $rd ok]} {
+        return [dict create restored 0 collisions 0 refused 0 failed 0 manifest_ok 1 refresh_note "" \
+            trash_note "Restore did not run: the trash manifest cannot be read ([dict get $rd err]); nothing was moved."]
+    }
+    # v0.23.3: a batch the manifest does not name is refused before anything
+    # moves (a stale card, or a manifest read that came back short).
+    set mine 0
+    foreach line [dict get $rd lines] {
+        set parts [split $line "|"]
+        if {[llength $parts] == 4 && [lindex $parts 3] eq $batch_id} { incr mine }
+    }
+    if {$mine == 0} {
+        msg -ERROR "ShotHistoryEditor: restore: batch $batch_id is not in [trash_manifest_path]"
+        return [dict create restored 0 collisions 0 refused 0 failed 0 manifest_ok 1 refresh_note "" \
+            trash_note "Restore did not run: batch $batch_id is not in the trash manifest; nothing was moved."]
+    }
     set keep {}
     set restored 0
     set collisions 0
+    set refused 0
+    set failed 0
 
-    foreach rec $records {
+    foreach line [dict get $rd lines] {
+        set parts [split $line "|"]
+        # A line that is not ts|orig|trash|batch names no file: kept as it is.
+        if {[llength $parts] != 4} { lappend keep $line ; continue }
+        lassign $parts lts lorig ltrash lbatch
+        set rec [dict create ts $lts orig $lorig trash $ltrash batch $lbatch]
         if {[dict get $rec batch] ne $batch_id} {
-            lappend keep $rec
+            lappend keep $line
             continue
         }
-        set orig [dict get $rec orig]
         set trash [dict get $rec trash]
+        if {![_inside_trash_dir $trash]} {
+            incr refused
+            lappend keep $line
+            continue
+        }
         if {![file isfile $trash]} {
             # Nothing left to restore for this line; drop it from the manifest.
             continue
         }
-        if {[file exists $orig]} {
-            incr collisions
-            lappend keep $rec
+        set orig [_rebased_orig [dict get $rec orig] $trash]
+        if {$orig eq ""} {
+            incr refused
+            lappend keep $line
             continue
         }
-        catch { file mkdir [file dirname $orig] }
-        if {[catch { file rename -- $trash $orig }]} {
+        if {[file exists $orig]} {
             incr collisions
-            lappend keep $rec
+            lappend keep $line
+            continue
+        }
+        # v0.23.2: a folder or rename failure is its own count, with its
+        # reason in the app log (it was counted as "already in history").
+        set err ""
+        if {![file isdirectory [file dirname $orig]] && [catch { file mkdir [file dirname $orig] } err]} {
+            msg -ERROR "ShotHistoryEditor: restore: could not make [file dirname $orig]: $err"
+        } elseif {[catch { file rename -- $trash $orig } err]} {
+            msg -ERROR "ShotHistoryEditor: restore: $trash not moved back to $orig: $err"
+        } else {
+            set err ""
+        }
+        if {$err ne ""} {
+            incr failed
+            lappend keep $line
         } else {
             incr restored
             # v0.7.1: stamp the restored file's modification time -- the
@@ -2421,8 +3505,22 @@ proc ::plugins::ShotHistoryEditor::restore_batch {batch_id} {
         }
     }
 
-    _rewrite_manifest $keep
-    _append_restore_log $batch_id $restored $collisions
+    # v0.23.3: a restore that drops no line (every file kept, collided or
+    # refused) leaves the manifest as it is: nothing to rewrite.
+    if {[llength $keep] == [llength [dict get $rd lines]]} {
+        set manifest_ok 1
+        set rewritten unchanged
+    } else {
+        set manifest_ok [_manifest_write $keep]
+        set rewritten $manifest_ok
+    }
+    set log_ok [_append_restore_log $batch_id $restored $collisions $refused $rewritten $failed]
+    if {!$manifest_ok} {
+        msg -NOTICE "ShotHistoryEditor: restore of batch $batch_id moved $restored file(s) back but could not rewrite [trash_manifest_path]"
+    }
+    if {$refused > 0} {
+        msg -NOTICE "ShotHistoryEditor: restore of batch $batch_id refused $refused manifest record(s) (outside the trash folder, or not a history file name)"
+    }
 
     # v0.6.3: the same gap in reverse. A restored shot must start counting
     # again -- SDB's populate clears `removed` for a file that has reappeared,
@@ -2431,7 +3529,25 @@ proc ::plugins::ShotHistoryEditor::restore_batch {batch_id} {
     if {$restored > 0} {
         set note [_notify_downstream "the restore"]
     }
-    return [dict create restored $restored collisions $collisions refresh_note $note]
+    set trash_note [_restore_problem_note $restored $collisions $refused $manifest_ok $failed]
+    if {!$log_ok} {
+        if {$trash_note eq ""} { set trash_note "Restore: $restored file(s) back." }
+        append trash_note " delete_log.txt could not be written; see the app log."
+    }
+    return [dict create restored $restored collisions $collisions refused $refused failed $failed \
+        manifest_ok $manifest_ok refresh_note $note log_ok $log_ok trash_note $trash_note]
+}
+
+# v0.20.0: the Trash page's one-line report of a restore that did not simply
+# work ("" when it did: the batch's card just goes away, as before).
+proc ::plugins::ShotHistoryEditor::_restore_problem_note {restored collisions refused manifest_ok {failed 0}} {
+    set parts {}
+    if {$collisions > 0} { lappend parts "$collisions kept (that name is already in history)" }
+    if {$failed > 0} { lappend parts "$failed could not be moved back (see the log)" }
+    if {$refused > 0} { lappend parts "$refused refused (not a trash file or a history name)" }
+    if {!$manifest_ok} { lappend parts "the trash list could not be rewritten (see the log)" }
+    if {[llength $parts] == 0} { return "" }
+    return "Restore: $restored file(s) back; [join $parts {; }]."
 }
 
 # v0.8.2: idempotent. Every reader closes the handle when done and
@@ -2634,6 +3750,17 @@ proc ::plugins::ShotHistoryEditor::scroll_page {kind delta dui_page} {
             variable empty_preview_page_index
             incr empty_preview_page_index $delta
             _set_paged_text $dui_page empty_preview_text empty_preview_page_status [empty_trash_preview_text] empty_preview_page_index 1
+        }
+        migrate_preview {
+            variable migrate_preview_page_index
+            incr migrate_preview_page_index $delta
+            # v0.22.0: a file that vanishes mid-count or a folder that cannot
+            # be listed must not break the page: logged and shown instead.
+            if {[catch { migrate_preview_text } txt]} {
+                msg -ERROR "ShotHistoryEditor: the Move page could not be built: $txt"
+                set txt "The Move page could not be built: $txt\nNothing was moved. See the app log."
+            }
+            _set_paged_text $dui_page migrate_preview_text migrate_preview_page_status $txt migrate_preview_page_index 1
         }
     }
 }
@@ -2901,20 +4028,29 @@ proc ::plugins::ShotHistoryEditor::preview_change {} {
     if {[_field_kind $edit_field] eq "numeric" && ![string is double -strict $new_value]} {
         set edit_warning "Warning: $edit_field should be numeric. This is still preview only."
     }
+    # v0.23.0: say now what Save would refuse.
+    set vp [_bag_value_problem $edit_field $new_value]
+    if {$vp ne ""} { set edit_warning "This value cannot be saved: $edit_field $vp." }
 
-    set edit_preview_text [join [list \
+    # v0.23.0: compact (the text sits above the bottom bar), plus what a
+    # later version would change in history_v2 -- shown, never written.
+    set fn [_selected_filename]
+    # At most 8 caption rows fit above the bottom bar: one row per line, so
+    # long values are cut (the full value is on the page above).
+    set shown {}
+    foreach v [list [_display $old_value] [_display $new_value]] {
+        if {[string length $v] > 90} { set v "[string range $v 0 86]..." }
+        lappend shown $v
+    }
+    set lines [list \
         "Preview only -- tap Save Change below to write this." \
-        "" \
-        "Before:" \
-        "$edit_field = [_display $old_value]" \
-        "" \
-        "After:" \
-        "$edit_field = [_display $new_value]" \
-        "" \
-        "Editable source:" \
-        "history/[_selected_filename].shot settings block" \
-        "" \
-        "SDB and history_v2 are not written to; only history/*.shot changes on Save."] "\n"]
+        "Before: $edit_field = [lindex $shown 0]" \
+        "After: $edit_field = [lindex $shown 1]" \
+        "Save writes only history/$fn.shot (that one settings line); SDB is never written."]
+    if {$fn ne "" && $new_value ne ""} {
+        lappend lines {*}[_v2_preview_lines [v2_preview $fn [list $edit_field $new_value]]]
+    }
+    set edit_preview_text [join $lines "\n"]
     refresh_edit_preview_page ShotHistoryEditor_edit_preview
 }
 
@@ -2959,6 +4095,8 @@ proc ::plugins::ShotHistoryEditor::refresh_edit_confirm_page {page} {
     if {[_field_kind $edit_confirm_field] eq "numeric" && ![string is double -strict $edit_confirm_new_value]} {
         set warning "Warning: $edit_confirm_field is usually numeric."
     }
+    set vp [_bag_value_problem $edit_confirm_field $edit_confirm_new_value]
+    if {$vp ne ""} { set warning "This value cannot be saved: $edit_confirm_field $vp." }
 
     catch { dui item config $page confirm_shot_text -text "Shot: $edit_confirm_filename" }
     catch { dui item config $page confirm_file_text -text "File: history/$edit_confirm_filename.shot" }
@@ -2966,6 +4104,25 @@ proc ::plugins::ShotHistoryEditor::refresh_edit_confirm_page {page} {
     catch { dui item config $page confirm_before_text -text "Before: [_display $edit_confirm_old_value]" }
     catch { dui item config $page confirm_after_text -text "After: [_display $edit_confirm_new_value]" }
     catch { dui item config $page confirm_warning_text -text $warning }
+
+    # v0.23.0: one line on history_v2 (the detail is on Edit Preview).
+    # v0.23.2: last, after the page's own texts.
+    set v2 ""
+    if {$edit_confirm_filename ne ""} {
+        set pv [v2_preview $edit_confirm_filename [list $edit_confirm_field $edit_confirm_new_value]]
+        switch -- [dict get $pv status] {
+            none { set v2 "history_v2: no copy of this shot; nothing to update." }
+            ok {
+                if {[dict get $pv check] eq ""} {
+                    set v2 "history_v2: this Save also changes [llength [dict get $pv edits]] value(s) in its copy, after a checked backup (see Edit Preview)."
+                } else {
+                    set v2 "history_v2: this Save leaves it as it is ([dict get $pv check])."
+                }
+            }
+            default { set v2 "history_v2: this Save leaves it as it is ([dict get $pv message])." }
+        }
+    }
+    catch { dui item config $page confirm_v2_text -text $v2 }
 }
 
 # The one place this pass authorizes a real write. Everything up to here is
@@ -2986,6 +4143,9 @@ proc ::plugins::ShotHistoryEditor::confirm_save_submit {} {
     } else {
         lappend lines "Not saved: [dict get $result message]"
     }
+    if {[dict get $result ok] && ![_dget $result log_ok 1]} {
+        lappend lines "WARNING: edit_manifest.txt or edit_log.txt could not be written (see the app log); the card list may show the old value until SDB resyncs."
+    }
     lappend lines ""
     lappend lines "Backup: [dict get $result backup_path]"
     lappend lines ""
@@ -2993,9 +4153,15 @@ proc ::plugins::ShotHistoryEditor::confirm_save_submit {} {
     # SDB's own resync can finally see the edit -- before this, an edited shot
     # kept the timestamp it was first written with and SDB skipped it forever.
     # Grind Advisor is refreshed straight afterwards when it is installed.
-    lappend lines "This plugin still writes nothing but history/<shot>.shot. history_v2 is unchanged."
-    set note ""
-    catch { set note [dict get $result refresh_note] }
+    # v0.24.0: what happened to the shot's history_v2 copy.
+    if {[dict exists $result v2]} {
+        lappend lines [_v2_result_line [dict get $result v2]]
+    } else {
+        lappend lines "history_v2 is unchanged."
+    }
+    # v0.23.3: no catch -- a failed save has no refresh_note, and a caught
+    # error leaves errorInfo dirty for the next core error line.
+    set note [_dget $result refresh_note ""]
     if {$note ne ""} {
         lappend lines "Grind Advisor: $note"
     } else {
@@ -3035,7 +4201,7 @@ proc ::plugins::ShotHistoryEditor::refresh_edit_preview_page {page} {
     }
 
     set field_text "$edit_field ([_field_kind $edit_field])"
-    set status_text "Tap Preview Change to see Before/After, then Save Change to write it. SDB and history_v2 are never written to."
+    set status_text "Tap Preview Change to see Before/After, then Save Change to write it (and its history_v2 copy). SDB is never written."
     if {$edit_warning ne ""} { append status_text "\n$edit_warning" }
 
     catch { dui item config $page selected_shot -text $selected_text }
@@ -3105,6 +4271,375 @@ proc ::plugins::ShotHistoryEditor::read_history_v2_meta {filename} {
     dict set result status found
     dict set result values $values
     return $result
+}
+
+# ---------------------------------------------------------------------------
+# v0.23.0 -- history_v2 update PREVIEW (John, de1app PR #373 point 3: an
+# edited shot's history_v2/<ts>.json keeps the old values). Nothing here
+# writes. For an edit it finds, in the .json text, the value of each v2 path
+# the field lives at, says what a later version would put there, and checks
+# the result in memory: re-read with ::json::json2dict, only those values
+# may differ. Owner decisions 2026-10-21: only the fields being edited, a
+# shot without a .json is left alone (as SDB does), no backfill of earlier
+# edits. Never the core converter (shot::convert_legacy_to_v2) or SDB's
+# sync_v2_shot_file: both fill an old shot's raw arrays from the live shot.
+# ---------------------------------------------------------------------------
+
+# The v2 paths of a .shot settings field: its meta value (if it has one)
+# and app.data.settings.<field>, the copy of ::settings the app saved.
+proc ::plugins::ShotHistoryEditor::_v2_paths {field} {
+    switch -- $field {
+        bean_brand          { set m {meta bean brand} }
+        bean_type           { set m {meta bean type} }
+        bean_notes          { set m {meta bean notes} }
+        roast_level         { set m {meta bean roast_level} }
+        roast_date          { set m {meta bean roast_date} }
+        espresso_notes      { set m {meta shot notes} }
+        grinder_setting     { set m {meta grinder setting} }
+        grinder_dose_weight { set m {meta in} }
+        drink_weight        { set m {meta out} }
+        default             { set m "" }
+    }
+    set out {}
+    if {$m ne ""} { lappend out $m }
+    lappend out [list app data settings $field]
+    return $out
+}
+
+# The value tokens at the given key paths: path -> list of {start end}
+# (character indices into text). One regexp pass splits the JSON into
+# strings, structural characters and bare values; a key stack follows the
+# objects (arrays are walked, never matched).
+proc ::plugins::ShotHistoryEditor::_v2_find {text paths} {
+    set re [string map [list Q [format %c 34] B [format %c 92]] {Q(?:[^QBB]|BB.)*Q|[{}\[\],:]|[^\s{}\[\],:Q]+}]
+    set toks [regexp -all -indices -inline -- $re $text]
+    set stack {}
+    set pending ""
+    set found [dict create]
+    set n [llength $toks]
+    for {set i 0} {$i < $n} {incr i} {
+        lassign [lindex $toks $i] s e
+        set c [string index $text $s]
+        if {$c eq "\{" || $c eq "\["} {
+            lappend stack [list $c $pending]
+            set pending ""
+        } elseif {$c eq "\}" || $c eq "\]"} {
+            set stack [lrange $stack 0 end-1]
+            set pending ""
+        } elseif {$c eq ","} {
+            set pending ""
+        } elseif {$c ne ":"} {
+            if {[lindex $stack end 0] eq "\{" && $pending eq "" && $i + 1 < $n &&
+                [string index $text [lindex $toks [expr {$i + 1}] 0]] eq ":"} {
+                set pending [_json_unquote [string range $text $s $e]]
+                continue
+            }
+            if {$pending ne ""} {
+                set path {}
+                foreach fr [lrange $stack 1 end] { lappend path [lindex $fr 1] }
+                lappend path $pending
+                if {$path in $paths} { dict lappend found $path [list $s $e] }
+                set pending ""
+            }
+        }
+    }
+    return $found
+}
+
+# A JSON string token -> its text. Every JSON escape is also a Tcl
+# backslash escape, and only those are substituted.
+proc ::plugins::ShotHistoryEditor::_json_unquote {tok} {
+    return [subst -nocommands -novariables [string range $tok 1 end-1]]
+}
+
+# Text -> a JSON string token in the app's own style (huddle's jsondump:
+# backslash, quote, slash, newline, tab, CR, backspace, form feed escaped;
+# any other control character as a 4-digit hex escape; other characters as
+# they are, the file being UTF-8).
+proc ::plugins::ShotHistoryEditor::_json_quote {s} {
+    set bs [format %c 92]
+    set q [format %c 34]
+    set s [string map [list $bs $bs$bs $q $bs$q / $bs/ \n ${bs}n \t ${bs}t \r ${bs}r \
+        [format %c 8] ${bs}b [format %c 12] ${bs}f] $s]
+    set out ""
+    foreach ch [split $s ""] {
+        scan $ch %c code
+        if {$code < 32} { append out [format "%cu%04x" 92 $code] } else { append out $ch }
+    }
+    return "$q$out$q"
+}
+
+# The patched text for changes (a list of field value pairs), in memory.
+# Returns ok, message, edits (field path old new for each v2 value) and
+# text. Refuses a path that is missing or found twice, or whose value is not
+# a JSON string (every value in the app's own files is one).
+proc ::plugins::ShotHistoryEditor::_v2_patch_text {text changes} {
+    set want {}
+    foreach {field value} $changes {
+        foreach p [_v2_paths $field] { lappend want [list $p $field $value] }
+    }
+    set found [_v2_find $text [lmap w $want { lindex $w 0 }]]
+    set edits {} ; set spans {}
+    foreach w $want {
+        lassign $w p field value
+        set label [join $p .]
+        set hits {}
+        if {[dict exists $found $p]} { set hits [dict get $found $p] }
+        if {[llength $hits] != 1} {
+            return [dict create ok 0 message "$label [_pick [llength $hits] {appears more than once} {is not in the file}]" edits {} text ""]
+        }
+        lassign [lindex $hits 0] s e
+        set tok [string range $text $s $e]
+        if {[string index $tok 0] ne [format %c 34]} {
+            return [dict create ok 0 message "$label is not a text value" edits {} text ""]
+        }
+        lappend edits [dict create field $field path $p old [_json_unquote $tok] new $value]
+        lappend spans [list $s $e [_json_quote $value]]
+    }
+    foreach sp [lsort -integer -decreasing -index 0 $spans] {
+        lassign $sp s e tok
+        set text [string replace $text $s $e $tok]
+    }
+    return [dict create ok 1 message "" edits $edits text $text]
+}
+
+# "" when after re-reads as before with only the edits' values changed, else
+# why not. Needs tcllib's json (the app has it; Source Inspector uses it).
+proc ::plugins::ShotHistoryEditor::_v2_verify {before after edits} {
+    if {![llength [info commands ::json::json2dict]]} { return "not checked: the json package is missing" }
+    if {[catch { set a [::json::json2dict $after] } err]} { return "the patched file would not read back: $err" }
+    if {[catch { set b [::json::json2dict $before] } err]} { return "the file does not read: $err" }
+    foreach ed $edits {
+        set p [dict get $ed path]
+        if {[catch { dict get $a {*}$p } v] || $v ne [dict get $ed new]} { return "[join $p .] would not read back as the new value" }
+        # The same set on both sides, so both are rebuilt the same way and
+        # compare as strings only by their content.
+        dict set b {*}$p [dict get $ed new]
+        dict set a {*}$p [dict get $ed new]
+    }
+    if {$a ne $b} { return "something else in the file would change" }
+    return ""
+}
+
+# The preview for one shot and its changes (field value pairs): status
+# none (no .json: left alone), ok (edits, check), refused (why), error.
+proc ::plugins::ShotHistoryEditor::v2_preview {filename changes} {
+    set path [_json_file $filename]
+    set res [dict create status none path $path edits {} check "" message ""]
+    if {$path eq "" || ![file isfile $path]} {
+        dict set res message "no history_v2 copy of this shot; nothing to update"
+        return $res
+    }
+    if {[catch {
+        set fh [open $path r]
+        fconfigure $fh -encoding utf-8
+        set text [read $fh]
+        close $fh
+    } err]} {
+        if {[info exists fh]} { catch { close $fh } }
+        return [dict merge $res [dict create status error message "could not read it: $err"]]
+    }
+    # v0.23.2: a file the scanner or the check cannot handle is an error
+    # status for the page, logged, never an error thrown into it.
+    if {[catch {
+        set p [_v2_patch_text $text $changes]
+        if {[dict get $p ok]} { set chk [_v2_verify $text [dict get $p text] [dict get $p edits]] }
+    } err]} {
+        msg -ERROR "ShotHistoryEditor: history_v2 preview of $path failed: $err"
+        return [dict merge $res [dict create status error message "could not check it: $err"]]
+    }
+    if {![dict get $p ok]} {
+        return [dict merge $res [dict create status refused message [dict get $p message]]]
+    }
+    return [dict merge $res [dict create status ok edits [dict get $p edits] check $chk]]
+}
+
+# Bag Review's history_v2 sentence: how many of the files Save would change
+# have a copy (left as they are by this version; a later one updates the
+# changed fields). "" when no file changes.
+proc ::plugins::ShotHistoryEditor::_bag_v2_note {files} {
+    set have 0 ; set of 0
+    foreach f $files {
+        if {[dict get $f status] ne "change"} { continue }
+        incr of
+        if {[file isfile [_json_file [dict get $f filename]]]} { incr have }
+    }
+    if {$of == 0} { return "" }
+    return " history_v2: $have [translate of] $of [translate {have a copy; Save updates the changed fields there too.}]"
+}
+
+# The preview as text lines for a page (values cut to max characters).
+# v0.23.2: every line fits one caption row (row characters): each value's
+# share shrinks with its path label, and any longer line is cut.
+proc ::plugins::ShotHistoryEditor::_v2_preview_lines {pv {max 40} {row 120}} {
+    set name [file tail [dict get $pv path]]
+    switch -- [dict get $pv status] {
+        none    { set lines [list "history_v2: [dict get $pv message]."] }
+        refused { set lines [list "history_v2/$name: Save leaves it as it is ([dict get $pv message])."] }
+        error   { set lines [list "history_v2/$name: [dict get $pv message]; Save leaves it as it is."] }
+        default {
+            set lines [list "history_v2/$name -- Save changes these values too (backed up and checked first):"]
+            foreach ed [dict get $pv edits] {
+                set label [join [dict get $ed path] .]
+                set m [expr {min($max, max(8, ($row - [string length $label] - 12) / 2))}]
+                set o [string map {\n " " \r " " \t " "} [dict get $ed old]]
+                set n [string map {\n " " \r " " \t " "} [dict get $ed new]]
+                foreach v {o n} { if {[string length [set $v]] > $m} { set $v "[string range [set $v] 0 [expr {$m - 4}]]..." } }
+                set q [format %c 34]
+                lappend lines "  $label: $q$o$q -> $q$n$q"
+            }
+            set chk [dict get $pv check]
+            if {$chk eq ""} {
+                lappend lines "  Checked: it would read back with only these [llength [dict get $pv edits]] values changed."
+            } else {
+                lappend lines "  Save leaves it as it is: $chk."
+            }
+        }
+    }
+    set out {}
+    foreach l $lines {
+        set l [string map {\n " " \r " "} $l]
+        if {[string length $l] > $row} { set l "[string range $l 0 [expr {$row - 4}]]..." }
+        lappend out $l
+    }
+    return $out
+}
+
+# ---------------------------------------------------------------------------
+# v0.24.0 -- the FIRST history_v2 WRITE (WRITE CAPABILITY 10; John, de1app PR
+# #373 point 3; owner decision 2026-10-21). After a .shot write that has been
+# made, verified and logged -- the single-field Save and every file of a bag
+# Save -- the same field(s) are changed in the shot's history_v2/<ts>.json:
+# only the mapped string values (_v2_paths: the meta value and
+# app.data.settings.<field>), never an array, a sensor series or anything
+# else; never the core converter. Order, each step checked:
+#   1  the .json read as bytes (plain UTF-8 only), patched in memory
+#      (_v2_patch_text), the result re-read with tcllib json (_v2_verify:
+#      only those values differ) -- else SKIPPED, nothing written
+#   2  backup into the save's own backups/ folder, byte for byte
+#   3  V2 BEGIN in edit_log.txt (write-ahead: no line, no write)
+#   4  temp file in that backup folder, read back byte for byte, verified
+#   5  one rename over the .json; read back byte for byte
+#   6  a failed rename or read-back: the backup copied back and checked
+#      (_bag_restore); RESTORE_FAILED names the intact copy
+# A v2 result never rolls back or stops the .shot write; the result pages
+# and edit_log.txt (V2 OK | UNCHANGED | ABSENT | SKIPPED | FAILED |
+# RESTORE_FAILED) say what happened. A shot without a .json is left alone.
+# ---------------------------------------------------------------------------
+
+# A path directly inside the current history_v2 folder.
+proc ::plugins::ShotHistoryEditor::_inside_history_v2_dir {path} {
+    set root [file normalize [history_v2_path]]
+    set p [file normalize $path]
+    return [expr {[string first "$root/" $p] == 0 && [file dirname $p] eq $root}]
+}
+
+# One shot's .json. changes: field value pairs; backup_dir: the save's
+# backup folder (exists, inside backups/). Returns dict status (ok,
+# unchanged, absent, skipped, failed, restore_failed), reason, path,
+# backup, edits. Only _v2_save calls it.
+proc ::plugins::ShotHistoryEditor::_v2_write {ts filename changes backup_dir} {
+    set path [_json_file $filename]
+    set out [dict create status absent reason "" path $path backup "" edits {}]
+    if {$path eq "" || ![file isfile $path]} {
+        dict set out reason "no history_v2 copy"
+        return $out
+    }
+    if {![_inside_history_v2_dir $path] || ![_inside_backups_dir [file join $backup_dir x]]} {
+        return [dict merge $out [dict create status failed reason "a path left its folder; nothing written"]]
+    }
+    if {[catch { _read_bytes $path } raw]} {
+        return [dict merge $out [dict create status skipped reason "could not read it ($raw)"]]
+    }
+    set text [encoding convertfrom utf-8 $raw]
+    if {[encoding convertto utf-8 $text] ne $raw} {
+        return [dict merge $out [dict create status skipped reason "not plain UTF-8; left as it is"]]
+    }
+    set p [_v2_patch_text $text $changes]
+    if {![dict get $p ok]} {
+        return [dict merge $out [dict create status skipped reason [dict get $p message]]]
+    }
+    dict set out edits [dict get $p edits]
+    set chk [_v2_verify $text [dict get $p text] [dict get $p edits]]
+    if {$chk ne ""} {
+        return [dict merge $out [dict create status skipped reason $chk]]
+    }
+    set bytes [encoding convertto utf-8 [dict get $p text]]
+    if {$bytes eq $raw} {
+        return [dict merge $out [dict create status unchanged reason "it already holds these values"]]
+    }
+    set backup [file join $backup_dir "$filename.json"]
+    set tmp [file join $backup_dir "$filename.json.new"]
+    dict set out backup $backup
+    if {[file exists $backup] || [file exists $tmp]} {
+        return [dict merge $out [dict create status failed reason "its backup name is taken; nothing written"]]
+    }
+    if {[catch { file copy -- $path $backup } err] || [_read_bytes_or_empty $backup] ne $raw} {
+        return [dict merge $out [dict create status failed reason "the backup did not check out; nothing written"]]
+    }
+    set fields [lsort -unique [lmap e [dict get $p edits] { dict get $e field }]]
+    if {![_she_append [edit_log_path] "$ts V2 BEGIN file=[file tail $path] fields=[join $fields ,] backup=$backup"]} {
+        return [dict merge $out [dict create status failed reason "edit_log.txt could not be written; nothing written"]]
+    }
+    if {[catch { _write_bytes $tmp $bytes } err]} {
+        return [dict merge $out [dict create status failed reason "temp file not written ($err); the .json untouched"]]
+    }
+    if {[_read_bytes_or_empty $tmp] ne $bytes ||
+        [_v2_verify $text [encoding convertfrom utf-8 [_read_bytes_or_empty $tmp]] [dict get $p edits]] ne ""} {
+        return [dict merge $out [dict create status failed reason "temp file did not read back; the .json untouched"]]
+    }
+    if {[catch { file rename -force -- $tmp $path } err]} {
+        if {[_read_bytes_or_empty $path] eq $raw} {
+            return [dict merge $out [dict create status failed reason "not renamed into place ($err); the .json untouched"]]
+        }
+        return [dict merge $out [_bag_restore $path $backup $raw "rename failed ($err)"]]
+    }
+    if {[_read_bytes_or_empty $path] ne $bytes} {
+        return [dict merge $out [_bag_restore $path $backup $raw "the written .json did not read back"]]
+    }
+    return [dict merge $out [dict create status ok reason ""]]
+}
+
+# The one caller of _v2_write: runs it (an error inside is a FAILED result,
+# never an error thrown into the save), writes its edit_log line and returns
+# its result plus log_ok.
+proc ::plugins::ShotHistoryEditor::_v2_save {ts filename changes backup_dir} {
+    if {[catch { _v2_write $ts $filename $changes $backup_dir } r]} {
+        msg -ERROR "ShotHistoryEditor: history_v2 write of $filename stopped by an error: $r"
+        set r [dict create status failed reason "stopped by an error: $r" path [_json_file $filename] backup "" edits {}]
+    }
+    set name [file tail [dict get $r path]]
+    set fields [join [lsort -unique [lmap e [dict get $r edits] { dict get $e field }]] ,]
+    set reason [_esc [dict get $r reason]]
+    switch -- [dict get $r status] {
+        ok             { set line "V2 OK file=$name fields=$fields values=[llength [dict get $r edits]] backup=[dict get $r backup]" }
+        unchanged      { set line "V2 UNCHANGED file=$name fields=$fields" }
+        absent         { set line "V2 ABSENT file=$filename.json (no history_v2 copy; left alone)" }
+        skipped        { set line "V2 SKIPPED file=$name reason=$reason" }
+        restore_failed { set line "V2 RESTORE_FAILED file=$name intact_copy=[dict get $r backup] reason=$reason" }
+        default        { set line "V2 FAILED file=$name reason=$reason" }
+    }
+    switch -- [dict get $r status] {
+        failed - restore_failed { msg -ERROR "ShotHistoryEditor: $line" }
+        skipped { msg -NOTICE "ShotHistoryEditor: $line" }
+    }
+    dict set r log_ok [_she_append [edit_log_path] "$ts $line"]
+    return $r
+}
+
+# One line for a result page about one shot's history_v2 copy.
+proc ::plugins::ShotHistoryEditor::_v2_result_line {r} {
+    set name "history_v2/[file tail [dict get $r path]]"
+    switch -- [dict get $r status] {
+        ok        { set s "$name: updated too ([llength [dict get $r edits]] value(s); backed up and checked)." }
+        unchanged { set s "$name: already held the new value; not written." }
+        absent    { set s "history_v2: no copy of this shot; nothing to update." }
+        skipped   { set s "$name: left as it is ([dict get $r reason]); the .shot change stands." }
+        restore_failed { set s "$name: the write went wrong and could NOT be put back; the intact copy is [dict get $r backup]. The .shot change stands." }
+        default   { set s "$name: NOT updated ([dict get $r reason]); the .shot change stands." }
+    }
+    if {![_dget $r log_ok 1]} { append s " Its edit_log.txt line could not be written." }
+    return $s
 }
 
 proc ::plugins::ShotHistoryEditor::_norm {value} {
@@ -3281,6 +4816,7 @@ proc ::plugins::ShotHistoryEditor::diagnostics_text {} {
         "  [join $object_lines "\n  "]" \
         "Detected table/view used: [_display $table_used]" \
         "Scrolling support: [scrolling_support_text]" \
+        "Data root (history, history_v2): [_data_root] ([_pick [llength [info commands ::data_directory]] {the app's data_directory} {homedir: this app has no data_directory}])" \
         "history folder path: $history_dir" \
         "history_v2 folder path: $history_v2_dir" \
         "Number of SDB shots found: $shot_count" \
@@ -3299,6 +4835,7 @@ proc ::plugins::ShotHistoryEditor::diagnostics_text {} {
         "Backups folder path: [backups_dir]" \
         "Edit manifest path: [edit_manifest_path]" \
         "Edit log path: [edit_log_path]" \
+        "SHE's own files: [_she_data_dir] (state: [dict get [_she_layout] state]; history_trash: [_she_new_root]; legacy: [join [_she_legacy_roots] {, }])" \
         "Bag fields in SDB (Bags view): [_bag_field_detect]" \
         "Issues:" \
         "  [join $issues "\n  "]"] "\n"]
@@ -3317,21 +4854,23 @@ proc ::plugins::ShotHistoryEditor::help_text {} {
     return [join [list \
         "SDB is used for browsing and searching recent shots and is never written to." \
         "The legacy history/*.shot settings block is the durable, real source for editable metadata." \
-        "history_v2 is read-only for comparison; edits and deletes never write to it (see below)." \
+        "history_v2 (v0.24.0): a Save also changes the edited fields in the shot's history_v2 .json (backup, check, rename); a failure there never undoes the .shot. A delete moves the .json with the .shot." \
+        "Edit Preview shows those history_v2 values, old -> new, and whether the changed file checks out; a shot without a .json is left alone." \
         "" \
-        "Real metadata save (v0.5.0): pick one safe field, type a value, Preview Change, then Save Change and confirm. Only that one settings line of history/<filename>.shot is rewritten, after a whole-file backup (plugins/ShotHistoryEditor/backups/) and verified before and after; a failed save restores the backup. SDB and history_v2 are never written." \
+        "Real metadata save (v0.5.0): pick one safe field, type a value, Preview Change, then Save Change and confirm. Only that one settings line of history/<filename>.shot is rewritten, after a whole-file backup (in SHE's backups/ folder, history_trash/backups/ after the move) and verified before and after; a failed save is put back from the backup and checked. SDB is never written; history_v2 follows as above." \
         "" \
         "Safe editable fields:" \
         "grinder_setting, grinder_dose_weight, drink_weight, bean_brand, bean_type, espresso_notes, my_name, drinker_name." \
         "" \
-        "Soft delete (v0.4.0): selecting shots and tapping Delete opens a two-step confirmation (Review, then a typed Confirm). Confirming MOVES history/<filename>.shot and, if present, history_v2/<filename>.json into plugins/ShotHistoryEditor/trash/ -- files are only ever moved, never deleted, and never edited. SDB itself is never written to, so deleted shots are hidden by filtering the list against a manifest file, not by changing SDB." \
-        "Advanced > Trash / Restore lists every deleted batch and can move its files back to their original location." \
-        "Empty trash (Trash page) permanently removes the plugin trash's files after a typed confirmation; history/ is never touched." \
+        "Soft delete (v0.4.0): selecting shots and tapping Delete opens a two-step confirmation (Review, then a typed Confirm). Confirming MOVES history/<filename>.shot and, if present, history_v2/<filename>.json into SHE's trash/ folder (history_trash/trash/ after the move) -- files are only moved and never edited; only Empty trash deletes them, .json files included. SDB itself is never written to, so deleted shots are hidden by filtering the list against a manifest file, not by changing SDB." \
+        "Advanced > Trash / Restore lists every deleted batch and can move its files back into history/ and history_v2/." \
+        "Empty trash (Trash page) permanently removes every file in SHE's trash (each deleted shot's .shot and its history_v2 .json) after a typed confirmation; nothing else in history/ or history_v2/ is touched." \
+        "Move trash and logs (Advanced, v0.22.0): moves the trash, backups and logs once from the plugin folder to history_trash/ in the app's data folder, by renaming only, after a typed count. A new install starts there." \
         "" \
         "Raw pressure, flow, temperature, resistance, shot_series, chart arrays, and machine sensor data are off-limits -- never displayed for editing, never modified." \
         "Reconcile hidden shots (Advanced, v0.10.0): shots the trash manifest still hides although their file is back in history/. Unhide appends one marker line to reconcile_manifest.txt (plus an audit line); the trash entry is never edited." \
         "" \
-        "Bags (v0.16.0): the Bags tab groups shots by roaster and bag name, newest first. Edit bag changes a bag's roaster, name, notes, roast date or roast level in every file of the bag (cleaning runs included): Review shows each field now and after, then Save asks you to type the number of files. Each file is backed up to plugins/ShotHistoryEditor/backups/ and checked first, rewritten (only those settings lines) and checked again; a failed check restores its backup. edit_log.txt records every file. SDB and history_v2 are never written. If the bag is the one loaded for your next shot (DYE's plan), Save updates the next shot too; Review says so and the result page lists what changed (without DYE it lists what to enter again)." \
+        "Bags (v0.16.0): the Bags tab groups shots by roaster and bag name, newest first. Edit bag changes a bag's roaster, name, notes, roast date or roast level in every file of the bag (cleaning runs included): Review shows each field now and after, then Save asks you to type the number of files. Each file is backed up to SHE's backups/ folder and checked first, rewritten (only those settings lines) and checked again; a failed check restores its backup. edit_log.txt records every file. SDB is never written; each saved file's history_v2 copy gets the same changed fields. If the bag is the one loaded for your next shot (DYE's plan), Save updates the next shot too; Review says so and the result page lists what changed (without DYE it lists what to enter again)." \
         "Cleaning runs are marked CLEANING on the Shots tab and never counted as shots." \
         "" \
         "Rinse, flush, steam, hot water, and cleaning shots never trigger anything in this plugin -- it has no automatic hooks at all."] "\n"]
@@ -3827,8 +5366,23 @@ proc ::plugins::ShotHistoryEditor::confirm_delete_submit {} {
     set trash_path [dict get $result trash_path]
 
     set lines [list]
+    # v0.23.1: the trash manifest could not take the batch's lines, so the
+    # files went back (or some could not): no undo through Trash / Restore.
+    if {[dict exists $result put_back]} {
+        lappend lines "Not deleted: [dict get $result message]"
+        set stuck [dict get $result stuck]
+        if {[llength $stuck]} {
+            lappend lines ""
+            lappend lines "These [llength $stuck] file(s) are in $trash_path but NOT in the trash list, so Trash / Restore cannot see them:"
+            foreach s $stuck { lappend lines "  $s" }
+            lappend lines "Move them back into history/ (or history_v2/ for a .json) by hand; see the app log."
+        }
+        set delete_result_text [join $lines "\n"]
+        open_page ShotHistoryEditor_delete_result
+        return
+    }
     if {[dict get $result ok]} {
-        lappend lines "Moved $moved_files file(s) for $shot_count shot(s) to the plugin trash folder."
+        lappend lines "Moved $moved_files file(s) for $shot_count shot(s) to SHE's trash folder."
     } else {
         lappend lines "Stopped: [dict get $result message]"
         lappend lines "Moved $moved_files file(s) for $shot_count shot(s) before stopping."
@@ -3845,12 +5399,14 @@ proc ::plugins::ShotHistoryEditor::confirm_delete_submit {} {
     # v0.6.3: say whether the recommendation was recomputed, the same way the
     # edit result page does. Before this the deleted shots kept counting
     # towards the grind recommendation and nothing on screen said so.
-    set note ""
-    catch { set note [dict get $result refresh_note] }
+    set note [_dget $result refresh_note ""]
     if {$note ne ""} {
         lappend lines "Grind Advisor: $note"
     } else {
         lappend lines "SDB is not written to directly; the card list overlays this until SDB resyncs."
+    }
+    if {[dict get $result moved_files] > 0 && ![_dget $result log_ok 1]} {
+        lappend lines "WARNING: delete_log.txt could not be written (the trash manifest was); see the app log."
     }
     lappend lines ""
     lappend lines "Nothing was permanently deleted. Use Advanced > Trash / Restore to undo."
@@ -3884,8 +5440,12 @@ proc ::plugins::ShotHistoryEditor::close_delete_result {} {
 
 proc ::plugins::ShotHistoryEditor::restore_trash_batch {batch_id} {
     variable trash_offset
+    variable tidy_note
     set result [restore_batch $batch_id]
     set trash_offset 0
+    # v0.20.0: the page's one-shot note (Tidy's since v0.15.2) also carries a
+    # restore that kept or refused files or could not update the trash list.
+    set tidy_note [_dget $result trash_note]
     refresh_trash_page ShotHistoryEditor_trash
     return $result
 }
@@ -5112,7 +6672,7 @@ proc ::plugins::ShotHistoryEditor::_paint_bag_review {page} {
         "1. [translate {Back up all}] [_plural $n file files] [translate {to backups/ and check each copy.}]" \
         "2. [translate {Rewrite only the}] $which [translate {lines in each file.}]" \
         "3. [translate {Check each file; a failed check restores its backup.}]" \
-        "4. [translate {Log each file; never write SDB or history_v2.}]"] {
+        "4. [translate {Log each file, update its history_v2 copy; never SDB.}]"] {
         lappend steps [_wrap_lines $s $L(font_body) $panel_w 2]
     }
     set np [_bag_next_for_plan]
@@ -5122,7 +6682,7 @@ proc ::plugins::ShotHistoryEditor::_paint_bag_review {page} {
     set steps [split [join $steps "\n"] "\n"]
     catch { dui item config $page rv_do_text -text [join [lrange $steps 0 [expr {$L(rv_fl_lines) - 1}]] "\n"] }
     catch { dui item config $page rv_do_note -fill $L(text_mut) -text [_wrap_lines \
-        [translate "Nothing is written until you type the number of files on the next page."] \
+        "[translate {Nothing is written until you type the number of files on the next page.}][_bag_v2_note [dict get $bag_plan files]]" \
         $L(font_caption) $panel_w 2] }
 
     # Files, newest first, each with what Save would do to it.
@@ -5591,6 +7151,9 @@ proc ::plugins::ShotHistoryEditor::_bag_value_problem {field v} {
 proc ::plugins::ShotHistoryEditor::_bag_save_blocker {} {
     variable bag_cur
     if {$bag_cur eq ""} { return [translate "No bag is open."] }
+    # v0.22.0: backups and logs go to SHE's folder (see _she_write_blocker).
+    set why [_she_write_blocker]
+    if {$why ne ""} { return "[string toupper [string index $why 0]][string range $why 1 end]." }
     set n 0
     set id_changed 0
     array set new {}
@@ -6020,7 +7583,7 @@ proc ::plugins::ShotHistoryEditor::_bag_restore {path backup expected_raw why} {
 # folder is named; v0.18.0, for the next-shot preview log line).
 proc ::plugins::ShotHistoryEditor::perform_bag_save {plan} {
     set res [dict create ok 0 message "" written {} unchanged {} skipped {} failed {} \
-        restore_failed {} not_attempted {} backup_dir "" ts "" batch ""]
+        restore_failed {} not_attempted {} backup_dir "" ts "" batch "" v2 {}]
     set blocker [_bag_save_blocker]
     if {$blocker eq ""} { set blocker [dict get $plan blocker] }
     if {$blocker ne ""} {
@@ -6112,6 +7675,11 @@ proc ::plugins::ShotHistoryEditor::perform_bag_save {plan} {
                 if {!$logged} {
                     dict set res message [translate "edit_log.txt or edit_manifest.txt could not be written; stopped after this file."]
                     set stop 1
+                } else {
+                    # v0.24.0: the changed fields in this shot's history_v2
+                    # copy too; its result never stops or undoes the Save.
+                    set v [_v2_save $ts $fn $changes $dir]
+                    dict lappend res v2 [list $fn [dict get $v status] [dict get $v reason] [dict get $v backup] [_dget $v log_ok 1]]
                 }
             }
             unchanged { dict lappend res unchanged $fn }
@@ -6287,9 +7855,9 @@ proc ::plugins::ShotHistoryEditor::_paint_bag_confirm {page} {
     append info "\n[translate {Every file is backed up and checked first, then rewritten and checked again; a failed check puts its backup back.}]"
     set np [_bag_next_for_plan]
     if {$np ne "" && [dict get $np status] eq "update" && [_dye_next_api]} {
-        append info "\n[translate {history/*.shot changes, and through DYE your next-shot plan; SDB, history_v2 copies and Visualizer uploads keep the old values.}]"
+        append info "\n[translate {history/*.shot and its history_v2 copies change, and through DYE your next-shot plan; SDB and Visualizer uploads keep the old values.}]"
     } else {
-        append info "\n[translate {Only history/*.shot changes: SDB, history_v2 copies and Visualizer uploads keep the old values.}]"
+        append info "\n[translate {history/*.shot and its history_v2 copies change: SDB and Visualizer uploads keep the old values.}]"
     }
     set tw [expr {$L(content_w) - 2 * $L(card_pad_x)}]
     catch { dui item config $page bc_files -text [join [lmap l [split $info "\n"] { _wrap_lines $l $L(font_body) $tw 2 }] "\n"] }
@@ -6392,6 +7960,33 @@ proc ::plugins::ShotHistoryEditor::bag_confirm_submit {} {
     _bag_flow_mark
 }
 
+# v0.24.0: the bag Save's history_v2 outcome, from the res v2 list (one
+# {filename status reason backup log_ok} per written .shot): one count line,
+# then any file that went wrong (a restore failure always, at most two others).
+proc ::plugins::ShotHistoryEditor::_bag_v2_summary {v2} {
+    if {[llength $v2] == 0} { return {} }
+    set n [dict create ok 0 unchanged 0 absent 0 skipped 0 failed 0 restore_failed 0]
+    set bad {} ; set rf {} ; set log_bad 0
+    foreach e $v2 {
+        lassign $e fn st why backup log_ok
+        if {![dict exists $n $st]} { set st failed }
+        dict incr n $st
+        if {$st eq "restore_failed"} { lappend rf "   history_v2/$fn.json: [translate {could NOT be put back; the intact copy is}] $backup" }
+        if {$st eq "failed"} { lappend bad "   history_v2/$fn.json: $why" }
+        if {!$log_ok} { incr log_bad }
+    }
+    set parts [list "[dict get $n ok] [translate updated]"]
+    if {[dict get $n unchanged]} { lappend parts "[dict get $n unchanged] [translate {already right}]" }
+    if {[dict get $n absent]} { lappend parts "[dict get $n absent] [translate {without a copy}]" }
+    if {[dict get $n skipped]} { lappend parts "[dict get $n skipped] [translate {left as they are}]" }
+    set nf [expr {[dict get $n failed] + [dict get $n restore_failed]}]
+    if {$nf} { lappend parts "$nf [translate {NOT updated}]" }
+    set lines [list "history_v2: [join $parts {, }] ([translate {the .shot changes stand; see edit_log.txt, V2 lines}])."]
+    lappend lines {*}$rf {*}[lrange $bad 0 1]
+    if {$log_bad} { lappend lines "   [translate {edit_log.txt could not take}] $log_bad V2 [translate line(s)]." }
+    return $lines
+}
+
 # next = the _bag_next_apply result ("" or 0: none).
 proc ::plugins::ShotHistoryEditor::_bag_result_text {r n changed_identity next note} {
     set w [llength [dict get $r written]]
@@ -6430,10 +8025,11 @@ proc ::plugins::ShotHistoryEditor::_bag_result_text {r n changed_identity next n
         lappend lines {*}[_bag_next_lines $next]
     }
     if {$w > 0} {
+        lappend lines {*}[_bag_v2_summary [_dget $r v2 {}]]
         if {[llength $next] > 1 && [dict get $next status] eq "applied"} {
-            lappend lines [translate "history/*.shot and, through DYE, your next-shot plan changed; SDB is never written by this plugin; history_v2 copies and Visualizer uploads keep the old values."]
+            lappend lines [translate "history/*.shot and, through DYE, your next-shot plan changed; SDB is never written by this plugin; Visualizer uploads keep the old values."]
         } else {
-            lappend lines [translate "Only history/*.shot changed: SDB is never written by this plugin; history_v2 copies and Visualizer uploads keep the old values."]
+            lappend lines [translate "history/*.shot changed: SDB is never written by this plugin; Visualizer uploads keep the old values."]
         }
         lappend lines [_pick [expr {$note ne ""}] "Grind Advisor: $note" \
             [translate "SDB picks the change up on its next resync (SDB settings: Resync database to history)."]]
@@ -6651,7 +8247,8 @@ namespace eval ::dui::pages::ShotHistoryEditor_advanced {
         foreach {card x title rows} [list \
             sec_recover $lx "Recover" {
                 trash_restore "Trash / Restore" ShotHistoryEditor_trash
-                reconcile "Reconcile hidden shots" ShotHistoryEditor_reconcile} \
+                reconcile "Reconcile hidden shots" ShotHistoryEditor_reconcile
+                migrate_preview "Move trash and logs..." ShotHistoryEditor_migrate_preview} \
             sec_inspect $L(sec_col2_x) "Inspect" {
                 source_inspector "Source Inspector (Shot Detail)" ShotHistoryEditor_recent
                 diagnostics "Diagnostics" ShotHistoryEditor_diagnostics
@@ -6804,10 +8401,16 @@ namespace eval ::dui::pages::ShotHistoryEditor_edit_confirm {
             -font $L(font_body) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
         dui add dtext $page $lx [expr {$L(toolbar_y0)+3*$L(lg)}] -tags confirm_before_text -text "" \
             -font $L(font_primary) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
-        dui add dtext $page $lx [expr {$L(toolbar_y0)+4*$L(lg)}] -tags confirm_after_text -text "" \
+        # v0.23.0: an xs gap below each primary line (the 22 px lines are one
+        # lg tall, so Before, After and the warning touched; the known polish
+        # item, found by this pass's page check).
+        dui add dtext $page $lx [expr {$L(toolbar_y0)+4*$L(lg)+$L(xs)}] -tags confirm_after_text -text "" \
             -font $L(font_primary) -width $L(content_w) -fill $L(danger) -anchor nw -justify left
-        dui add dtext $page $lx [expr {$L(toolbar_y0)+5*$L(lg)}] -tags confirm_warning_text -text "" \
+        dui add dtext $page $lx [expr {$L(toolbar_y0)+5*$L(lg)+2*$L(xs)}] -tags confirm_warning_text -text "" \
             -font $L(font_caption) -width $L(content_w) -fill $L(warn) -anchor nw -justify left
+        # v0.23.0: what happens to the shot's history_v2 copy (nothing yet).
+        dui add dtext $page $lx [expr {$L(toolbar_y0)+7*$L(lg)+2*$L(xs)}] -tags confirm_v2_text -text "" \
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor nw -justify left
 
         # v0.6.2: Cancel takes the far-left slot -- it is this page's way out,
         # the same role Done plays everywhere else, so backing out of the
@@ -7072,7 +8675,9 @@ namespace eval ::dui::pages::ShotHistoryEditor_edit_preview {
         set status_y [expr {$row4_y+$L(btn_h)+$L(xxl)}]
         dui add dtext $page $lx $status_y -tags preview_status -text "" \
             -font $L(font_caption) -width $L(content_w) -fill $L(warn) -anchor nw -justify left
-        dui add dtext $page $lx [expr {$status_y+$L(xl)}] -tags preview_text -text "" \
+        # v0.23.0: two caption rows below the status (it is two rows with a
+        # warning, and touched the text at xl), then the up-to-9-row preview.
+        dui add dtext $page $lx [expr {$status_y+2*$L(caption_h)+$L(sm)}] -tags preview_text -text "" \
             -font $L(font_caption) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
 
         # v0.15.1 (F13): one way out -- Back, bottom-left, the same corner
@@ -7250,6 +8855,101 @@ namespace eval ::dui::pages::ShotHistoryEditor_empty_preview {
         } else {
             catch { dui item hide $page_to_show empty_now* -initial 1 }
         }
+    }
+}
+
+# v0.21.0: the history_trash move page (Empty trash preview's shape: paged
+# text, Back, pager). v0.22.0: plus Move now... (Finish move... after a
+# stop), which only opens the typed confirmation; nothing on this page
+# writes. Greyed out whenever the plan refuses.
+namespace eval ::dui::pages::ShotHistoryEditor_migrate_preview {
+    proc setup {} {
+        set page [namespace tail [namespace current]]
+        upvar #0 ::plugins::ShotHistoryEditor::L L
+        ::plugins::ShotHistoryEditor::_page_bg $page
+        set lx $L(left_x)
+
+        ::plugins::ShotHistoryEditor::_subpage_header $page "Move trash and logs" \
+            "Moves the plugin's trash, backups and logs to the app's data folder. Nothing moves on this page."
+        dui add dtext $page $lx $L(toolbar_y0) -tags migrate_preview_page_status -text "" \
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor nw -justify left
+        dui add dtext $page $lx $L(list_top) -tags migrate_preview_text -text "" \
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
+        ::plugins::ShotHistoryEditor::_add_back $page \
+            {::plugins::ShotHistoryEditor::_return_to_page ShotHistoryEditor_advanced}
+        # The right group, an sm gap left of Prev (never beside Back).
+        set bw $L(btn_w_std)
+        set x [expr {$L(right_x) - 3*$bw - 2*$L(sm)}]
+        dui add dbutton $page $x $L(bar_y0) [expr {$x+$bw}] $L(bar_y1) -tags migrate_now \
+            -label [translate "Move now..."] -command ::plugins::ShotHistoryEditor::open_migrate_confirm \
+            -label_font $L(font_button) -style she_btn
+        ::plugins::ShotHistoryEditor::_add_pager $page prev_page next_page \
+            {::plugins::ShotHistoryEditor::scroll_page migrate_preview -1 ShotHistoryEditor_migrate_preview} \
+            {::plugins::ShotHistoryEditor::scroll_page migrate_preview 1 ShotHistoryEditor_migrate_preview}
+    }
+
+    proc show {page_to_hide page_to_show} {
+        set ::plugins::ShotHistoryEditor::migrate_preview_page_index 0
+        ::plugins::ShotHistoryEditor::scroll_page migrate_preview 0 $page_to_show
+        ::plugins::ShotHistoryEditor::_refresh_migrate_now $page_to_show
+    }
+}
+
+# v0.22.0: the move's typed confirmation (the Empty trash confirmation's
+# shape; the entry stays in the top half for the Android keyboard). Its show
+# builds the plan afresh, so what it lists is what the count is typed for.
+namespace eval ::dui::pages::ShotHistoryEditor_migrate_confirm {
+    proc setup {} {
+        set page [namespace tail [namespace current]]
+        upvar #0 ::plugins::ShotHistoryEditor::L L
+        ::plugins::ShotHistoryEditor::_page_bg $page
+        set lx $L(left_x); set rx $L(right_x)
+
+        ::plugins::ShotHistoryEditor::_subpage_header $page "Move trash and logs -- Confirm" \
+            "One rename per item into history_trash/. Nothing is deleted; only the manifest is copied."
+        dui add dtext $page $lx $L(toolbar_y0) -tags migrate_instructions -text "" \
+            -font $L(font_body) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
+        dui add entry $page $lx [expr {$L(toolbar_y0)+3*$L(lg)}] -tags migrate_entry \
+            -textvariable ::plugins::ShotHistoryEditor::migrate_input \
+            -width 20 -font $L(font_primary) -borderwidth 1 -bg $L(entry_bg) -foreground $L(value_blue) -relief flat \
+            -label [translate "Type the number here"] -label_pos [list $lx [expr {$L(toolbar_y0)+2*$L(lg)}]] \
+            -label_font $L(font_body) -label_width $L(label_col_w) -label_fill $L(text_body)
+        dui add dtext $page $lx [expr {$L(toolbar_y0)+5*$L(lg)}] -tags migrate_error_text -text "" \
+            -font $L(font_caption) -width $L(content_w) -fill $L(danger) -anchor nw -justify left
+        dui add dtext $page $lx [expr {$L(toolbar_y0)+7*$L(lg)}] -tags migrate_summary -text "" \
+            -font $L(font_caption) -width $L(content_w) -fill $L(text_mut) -anchor nw -justify left
+
+        dui add dbutton $page $lx $L(bar_y0) [expr {$lx+$L(btn_w_std)}] $L(bar_y1) -tags cancel \
+            -label [translate "Cancel"] -command ::plugins::ShotHistoryEditor::cancel_migrate_confirm \
+            -label_font $L(font_button) -style she_btn
+        dui add dbutton $page [expr {$rx-$L(btn_w_std)}] $L(bar_y0) $rx $L(bar_y1) -tags migrate_confirm_btn \
+            -label [translate "Move"] -command ::plugins::ShotHistoryEditor::confirm_migrate_submit \
+            -label_font $L(font_button) -style she_btn
+    }
+
+    proc show {page_to_hide page_to_show} {
+        ::plugins::ShotHistoryEditor::refresh_migrate_confirm_page $page_to_show 1
+    }
+}
+
+namespace eval ::dui::pages::ShotHistoryEditor_migrate_result {
+    proc setup {} {
+        set page [namespace tail [namespace current]]
+        upvar #0 ::plugins::ShotHistoryEditor::L L
+        ::plugins::ShotHistoryEditor::_page_bg $page
+        set lx $L(left_x)
+
+        ::plugins::ShotHistoryEditor::_subpage_header $page "Move trash and logs - result" \
+            "The outcome of the move. delete_log.txt records it in MIGRATE lines."
+        dui add dtext $page $lx $L(list_top) -tags migrate_result_text -text "" \
+            -font $L(font_body) -width $L(content_w) -fill $L(text_body) -anchor nw -justify left
+        dui add dbutton $page $lx $L(bar_y0) [expr {$lx+$L(btn_w_std)}] $L(bar_y1) -tags page_done \
+            -label [translate "Done"] -command {::plugins::ShotHistoryEditor::_return_to_page ShotHistoryEditor_advanced} \
+            -label_font $L(font_button) -style she_btn
+    }
+
+    proc show {page_to_hide page_to_show} {
+        catch { dui item config $page_to_show migrate_result_text -text $::plugins::ShotHistoryEditor::migrate_result_text }
     }
 }
 

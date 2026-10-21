@@ -1,7 +1,7 @@
 # Shot History Editor
 
 **Browse your shots as cards, fix a wrong grind or bean name, delete mistakes to a restorable trash.**
-Version v0.19.1 · a plugin for the Decent DE1app · by Blastize
+Version v0.24.0 · a plugin for the Decent DE1app · by Blastize
 
 ![The shot list: five cards per page with grind, dose, yield, time, bean and profile](docs/shot_list.png)
 
@@ -13,7 +13,7 @@ Version v0.19.1 · a plugin for the Decent DE1app · by Blastize
 
 ![Edit Preview: pick one field, type the new value, preview before and after, then save](docs/edit_preview.png)
 
-**Edit one field.** Pick the field, type the value, preview the before and after, then save. Only that one line of the shot file changes, after a backup. The shot database is never written.
+**Edit one field.** Pick the field, type the value, preview the before and after, then save. Only that one line of the shot file changes, after a backup, and the app's second copy of the shot (`history_v2`) gets the same value. The shot database is never written.
 
 ![Trash / Restore: deleted shots in batches, each with a Restore button](docs/trash.png)
 
@@ -37,15 +37,81 @@ Copy the folder to `de1plus/plugins/ShotHistoryEditor/`, restart the app, enable
 
 ## Safety
 
-SDB is read-only. Edits rewrite exactly one line of one `.shot` file after a whole-file backup; a bag edit rewrites only the changed bag lines of each of its `.shot` files, after every backup is made and checked, and stops at the first problem; when that bag is the one loaded for your next shot, DYE is asked to update the next shot's bean fields too (logged). Deletes move files into the plugin's trash and are logged; only Empty trash deletes for good, only inside that trash folder, after a typed confirmation. Raw pressure, flow and temperature data are never shown or edited.
+SDB is read-only. Edits rewrite exactly one line of one `.shot` file after a whole-file backup; a bag edit rewrites only the changed bag lines of each of its `.shot` files, after every backup is made and checked, and stops at the first problem. After each `.shot` is saved, the same fields change in that shot's `history_v2/<time>.json` (only those text values, after a checked backup, read back before and after the swap); a problem there is reported and never undoes the `.shot` change; when that bag is the one loaded for your next shot, DYE is asked to update the next shot's bean fields too (logged). Deletes move files into the plugin's trash and are logged; only Empty trash deletes for good, only inside that trash folder, after a typed confirmation. Move trash and logs renames the plugin's own trash, backups and logs once into `history_trash/` in the app's data folder, after a typed count; it deletes nothing, and the only copy it makes is the trash manifest's audit copy (`trash_manifest.before_move.txt`). Raw pressure, flow and temperature data are never shown or edited.
 
 <details>
 <summary><b>Full reference and version notes</b></summary>
 
 ## Reference
 
-Version: v0.19.1
+Version: v0.24.0
 Author: Blastize
+
+## history_v2 follows your edits (v0.24.0)
+
+The app keeps a second copy of every shot, `history_v2/<time>.json`. Since v0.24.0, a Save (one
+field, or a whole bag) changes the same fields there right after the `.shot` is saved: only the
+edited text values (the field's `meta` value and the app's saved setting), never the shot's
+pressure, flow or other data, and never anything else in the file. The `.json` is backed up next
+to the `.shot`'s backup first, the change is checked in memory and again after writing, and a
+problem puts the backup back. A shot without a `.json` is left alone, and shots edited before
+v0.24.0 are not touched. The result page and `edit_log.txt` (V2 lines) say what happened to each
+copy; a problem there never undoes the `.shot` change.
+
+## Safer trash list (v0.23.2, v0.23.3)
+
+The trash list (`trash_manifest.txt`) is now always replaced whole: the new list is written next
+to it, read back, then swapped in, so a full disk or a crash can no longer leave it cut short or
+half written. Restore and Empty trash stop with a message when the list cannot be read (before, an
+unreadable list looked empty and was rewritten empty). A failed single-field save is put back from
+its backup by copying, and checked; the backup stays. The history_v2 preview no longer stops on
+an unusual file. Since v0.23.3, Restore and Empty trash also stop when the list seems not to be
+there at all, Restore refuses a batch the list does not name, and a Restore that would not change
+the list (every file kept back) leaves it untouched.
+
+## history_v2 after an edit: preview (v0.23.0)
+
+(v0.24.0 now writes it; see above.) The app keeps a second copy of every shot, `history_v2/<time>.json`. Edits change only the
+`.shot`, so that copy keeps the old values. A later version will update it too; this one shows
+what it would do. On Edit Preview, below Before and After, you see each place in the `.json` that
+holds the field (its `meta` value and the app's saved setting), the old value and the new one,
+and "Checked" when the changed file would read back with only those values different. Nothing is
+written to history_v2 yet. A shot without a `.json` is left alone (SDB does the same), and shots
+edited earlier are not touched. The bag Review says how many of the bag's files have a copy. The
+single-field save now refuses a value with braces or a backslash, and waits while the machine
+runs or SDB syncs, like the bag save.
+
+## Moving the trash out of the plugin folder (v0.21.0 preview, v0.22.0 move)
+
+The trash, backups and logs move once from `plugins/ShotHistoryEditor/` to
+`<data root>/history_trash/`, so reinstalling or replacing the plugin can never take your
+deleted shots with it. Advanced > Recover > **Move trash and logs...** shows where the files are,
+where they go, how many batches, files and log lines move, and anything that would stop the move.
+**Move now...** asks you to type the number of items, then renames each one into the new folder:
+nothing is deleted (the trash manifest alone is copied, as trash_manifest.before_move.txt), your
+shots in history/ are not touched, and the delete log records the move in MIGRATE lines (begin,
+one per item, and OK or FAILED). If a step fails, everything is put back and checked on the disk, except when
+the re-pointed manifest itself cannot be put back: then every item stays in history_trash.moving with it, and
+**Finish move...** completes the move. If the tablet dies half
+way, the plugin refuses to delete, restore or save until **Finish move...** completes it. A new
+install starts in history_trash/ straight away. Until you move, everything keeps working from the
+plugin folder.
+
+## Where your files are (v0.20.0, v0.22.0)
+
+| What | Where | SHE does |
+|---|---|---|
+| Shot files | `<data root>/history/*.shot` | reads; edits one line (Edit) or the bag lines (Edit bag); moves to the trash on delete and back on restore; stamps the modification time |
+| history_v2 copies | `<data root>/history_v2/*.json` | reads; moves with the .shot on delete and restore; since v0.24.0 a Save changes the edited fields' text values in it (backup, check, rename) |
+| Shot database | SDB's own path (`::plugins::SDB::db_path`, normally `plugins/SDB/shots.db`) | reads only, through a read-only handle |
+| Trash, backups, logs | `<data root>/history_trash/` after the one-time move and on a new install (before the move: `plugins/ShotHistoryEditor/`): `trash/<time>_<batch>/`, `backups/`, `trash_manifest.txt` (+ `trash_manifest.before_move.txt` after the move), `delete_log.txt`, `purge_log.txt`, `reconcile_manifest.txt`, `edit_manifest.txt`, `edit_log.txt` | its own files; Empty trash deletes only inside that `trash/`; the move renames them once |
+| Theme setting | the app's plugin settings file | `plugins save_settings` |
+
+The data root is the app's `data_directory` when the app has one (de1app since June 2026), else
+`homedir`; today both are the same folder on every platform, so nothing moved. Restore puts a
+file back by name into the current `history/` (or `history_v2/` for a .json), not at the absolute
+path stored when it was deleted, and refuses anything else; Reconcile and Unhide look there too.
+Diagnostics shows the data root and where SHE's own files are (and in what state).
 
 ## Your next shot follows a bag edit (v0.18.0, v0.19.0)
 
