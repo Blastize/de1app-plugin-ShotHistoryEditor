@@ -1,7 +1,7 @@
 # Shot History Editor
 
 **Browse your shots as cards, fix a wrong grind or bean name, delete mistakes to a restorable trash.**
-Version v0.24.0 · a plugin for the Decent DE1app · by Blastize
+Version v0.24.1 · a plugin for the Decent DE1app · by Blastize
 
 ![The shot list: five cards per page with grind, dose, yield, time, bean and profile](docs/shot_list.png)
 
@@ -44,7 +44,7 @@ SDB is read-only. Edits rewrite exactly one line of one `.shot` file after a who
 
 ## Reference
 
-Version: v0.24.0
+Version: v0.24.1
 Author: Blastize
 
 ## history_v2 follows your edits (v0.24.0)
@@ -57,6 +57,11 @@ to the `.shot`'s backup first, the change is checked in memory and again after w
 problem puts the backup back. A shot without a `.json` is left alone, and shots edited before
 v0.24.0 are not touched. The result page and `edit_log.txt` (V2 lines) say what happened to each
 copy; a problem there never undoes the `.shot` change.
+
+Since v0.24.1 a bag Save no longer freezes the app while it does this. It saves every `.shot`
+first, then updates the copies one by one while the result page counts them ("updating the copies,
+5 of 24 done..."); other edits, deletes and restores wait until it is done. A copy that is not
+updated keeps its old values until a later Save of the same fields, and the result page says so.
 
 ## Safer trash list (v0.23.2, v0.23.3)
 
@@ -580,7 +585,7 @@ This version redesigns the main page as a one-page, card-based workflow. It is s
 
 ## Source Rules
 
-SDB is used for browsing and searching, and is never written to. Legacy `history/*.shot` is the durable source for editable metadata -- as of v0.5.0, saving via Edit Metadata Preview really writes ONE targeted key into its `settings{}` block (backup + verified write; every other byte untouched), and as of v0.4.0 the whole file can be moved (never permanently deleted) by soft delete. `history_v2/*.json` stays read-only for comparison in both cases: moved alongside its matching `.shot` on delete, never edited by a save.
+SDB is used for browsing and searching, and is never written to. Legacy `history/*.shot` is the durable source for editable metadata -- as of v0.5.0, saving via Edit Metadata Preview really writes ONE targeted key into its `settings{}` block (backup + verified write; every other byte untouched), and as of v0.4.0 the whole file can be moved (never permanently deleted) by soft delete. `history_v2/*.json` moves alongside its matching `.shot` on delete; since v0.24.0 a save also changes the same fields' text values in it (backup, check, rename; see "history_v2 follows your edits").
 
 Raw pressure, flow, temperature, resistance, and chart data are off-limits -- never displayed for editing, never modified by either write path.
 

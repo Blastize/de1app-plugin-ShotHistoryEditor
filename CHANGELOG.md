@@ -4,6 +4,42 @@ Note: entries follow the CLAUDE.md doc cap (about 15 lines each; entries that ad
 changed a write capability keep their full write-path description). The long pre-trim
 entries survive in the Desktop archive snapshot of each version.
 
+## v0.24.1 - history_v2: a bag Save no longer freezes; one parse per copy (2026-10-22)
+
+Base: v0.24.0. Protocol lane, pass_0.24.1.md. Sources: an independent review of 0.24.0 (no way to
+corrupt a v2 file found; these lows) and the owner's tablet hand check (the single-field history_v2
+write passed; a bag Save of 24 shots, "Bam Bam", froze the app for about 13 s).
+Changed write path (capability 10, history_v2):
+- Bag Save: `perform_bag_save` writes, checks and logs every .shot as before and only queues the
+  history_v2 updates (v2_todo). `_bag_v2_start` then logs a write-ahead "BAGSAVE V2 QUEUE".
+  `_bag_v2_step` runs one file per event-loop turn (`after`) through the same `_v2_save` (every
+  safety step unchanged), repaints the result page ("updating the copies, N of M done..."), and
+  logs "BAGSAVE V2 END" with the counts. An error stops the queue (-ERROR); the copies not reached
+  are reported FAILED "not attempted". A QUEUE line without its END means the app stopped mid-queue;
+  those copies keep their old values. While copies are queued, every SHE write (`_she_write_blocker`)
+  and the move's plan refuse.
+  Measured offline, 24 copies of the largest real pair (154 KB, harness json parser): v0.24.0 blocked
+  ~10.4 s in one go. v0.24.1 blocks ~2.1 s for the .shot Save (as before 0.24.0), then 24 steps of at
+  most ~0.27 s each. The tablet re-check of a large bag is the owner's.
+- `_v2_write` no longer parses the temp file again: it is compared byte for byte with the bytes
+  `_v2_verify` just passed. Each .json is now parsed twice (the patched text and the original), not
+  four times.
+- The single-field Save writes history_v2 only after its own edit_manifest and edit_log lines
+  (as the bag Save already did); otherwise "not attempted", logged -ERROR.
+Read-only:
+- Preview reads the .json as the writer does (bytes, plain UTF-8 only).
+- The result pages say how a copy that was not updated catches up.
+- The Extensions description now reads (owner-approved): "Browse and edit your shot history: one shot
+  or a whole bag (the .shot and its history_v2 copy), plus delete to a trash you can restore."
+- README and source comments no longer say history_v2 is never written.
+Safety status: write capabilities 1-10. `file rename` 12, `file copy` 5, `file mkdir` 6, and
+`file delete` still the two purge-only lines. SDB is never written.
+Tests: pass_0.24.1_offline.tcl (29 checks: json parses counted, the queue step by step, writes
+refused while queued, a stopped queue, the 24-copy timing); 12 of 12 mutants (mutants_0.24.1.py);
+every earlier net, with the 0.24.0 bag cases draining the queue. Tablet: verify.sh PASS run 1. An
+Extensions screenshot shows the new description in 3 lines, as the wrap with the tablet's font
+predicted.
+
 ## v0.24.0 - FIRST history_v2 WRITE: a Save updates the shot's .json too (2026-10-21)
 
 Base: v0.23.3 (its lows ship in this version; it never ran on the tablet alone). Protocol lane,
@@ -36,7 +72,9 @@ Safety status: write capabilities 1-10 exist; 10 is new. `file rename` 12 (+1, t
 `file copy` 5 (+1, the .json backup), `file mkdir` 6, and `file delete` still the two purge-only
 lines. SDB is never written; raw arrays are never touched.
 Tests: pass_0.24.0_offline.tcl (46 checks on copies of real pairs from the 2026-08-09 backup;
-Python's json is the oracle; every step fault-injected); 16 of 16 mutants (mutants_0.24.0.py); every
+Python's json is the oracle; every step fault-injected; `_v2_verify` ran against the harness's own
+re-implementation of json2dict, not tcllib, so the real tcllib pairing first runs at the owner's
+hand check on the tablet); 16 of 16 mutants (mutants_0.24.0.py); every
 earlier net, with the 0.23.0 page texts updated. Mutant runners now remove their read-only copies.
 Tablet: verify.sh PASS on run 2. Run 1 failed only because checks.json still expected the pre-move
 pages; the tablet had moved and its trash was empty. The history_v2 write has not yet run on a

@@ -81,6 +81,11 @@
 #   json, a checked backup, write-ahead V2 BEGIN, temp + read-back + one
 #   rename, restore from the backup on a bad rename/read-back. A v2 result
 #   never undoes or stops the .shot write. No .json: left alone.
+# - v0.24.1 (review of 0.24.0): one json parse pass per history_v2 write
+#   (the temp file is compared byte for byte, not parsed again); the
+#   single-field Save writes history_v2 only after its edit is logged;
+#   Preview reads the .json as the writer does (plain UTF-8 only); result
+#   pages say how a history_v2 copy that was not updated catches up.
 #
 
 catch { package require sqlite3 }
@@ -1165,6 +1170,11 @@ proc ::plugins::ShotHistoryEditor::_she_entry_path {name} {
 # path before it touches anything (delete, restore, edit, bag save, Empty
 # trash, Tidy, Unhide); the move itself has its own checks.
 proc ::plugins::ShotHistoryEditor::_she_write_blocker {} {
+    # v0.24.1: not while a bag Save's history_v2 copies are still queued.
+    set left [_bag_v2_pending]
+    if {$left > 0} {
+        return "[translate {the last bag Save is still updating its history_v2 copies}] ($left [translate left]); [translate {try again in a moment}]"
+    }
     set lay [_she_layout]
     switch -- [dict get $lay state] {
         unfinished {
@@ -1416,7 +1426,8 @@ proc ::plugins::ShotHistoryEditor::_she_move_plan {} {
         [expr {!$same_dev}] "one storage device, so each step is a rename" "the folders are on different storage devices: the move never copies" \
         [expr {[llength $unwritable] > 0}] "the folders can be written" "cannot be written: [join $unwritable {, }]" \
         [expr {$busy ne ""}] "the machine is idle" "the machine is busy ($busy)" \
-        [_sdb_busy] "SDB is not syncing" "SDB is syncing"]
+        [_sdb_busy] "SDB is not syncing" "SDB is syncing" \
+        [expr {[_bag_v2_pending] > 0}] "no bag Save is updating history_v2 copies" "a bag Save is still updating history_v2 copies"]
     set refusals {}
     switch -- $state {
         fresh { lappend refusals [translate "there is nothing to move"] }
@@ -2364,8 +2375,15 @@ proc ::plugins::ShotHistoryEditor::perform_metadata_edit {filename field new_val
     if {![_append_edit_log $ts $filename $field $old_value $new_value $backup_path "OK"]} { set log_ok 0 }
 
     # v0.24.0: the same field in history_v2/<f>.json (capability 10). Its
-    # result never undoes the .shot write above.
-    set v2 [_v2_save $ts $filename [list $field $new_value] $backup_dir]
+    # result never undoes the .shot write above. v0.24.1: only after the
+    # edit is logged, as in the bag Save.
+    if {$log_ok} {
+        set v2 [_v2_save $ts $filename [list $field $new_value] $backup_dir]
+    } else {
+        msg -ERROR "ShotHistoryEditor: history_v2 copy of $filename not attempted: the edit's edit_log/edit_manifest lines could not be written"
+        set v2 [dict create status skipped path [_json_file $filename] backup "" edits {} log_ok 0 \
+            reason "not attempted: edit_log.txt or edit_manifest.txt could not be written"]
+    }
 
     # v0.6.0: tell Grind Advisor, so the recommendation follows the correction
     # without anyone having to know that it should. v0.6.3 shared that with
@@ -4032,8 +4050,8 @@ proc ::plugins::ShotHistoryEditor::preview_change {} {
     set vp [_bag_value_problem $edit_field $new_value]
     if {$vp ne ""} { set edit_warning "This value cannot be saved: $edit_field $vp." }
 
-    # v0.23.0: compact (the text sits above the bottom bar), plus what a
-    # later version would change in history_v2 -- shown, never written.
+    # v0.23.0: compact (the text sits above the bottom bar), plus what the
+    # Save changes in history_v2 (written since v0.24.0, after the .shot).
     set fn [_selected_filename]
     # At most 8 caption rows fit above the bottom bar: one row per line, so
     # long values are cut (the full value is on the page above).
@@ -4046,7 +4064,7 @@ proc ::plugins::ShotHistoryEditor::preview_change {} {
         "Preview only -- tap Save Change below to write this." \
         "Before: $edit_field = [lindex $shown 0]" \
         "After: $edit_field = [lindex $shown 1]" \
-        "Save writes only history/$fn.shot (that one settings line); SDB is never written."]
+        "Save writes history/$fn.shot (that one settings line), then its history_v2 copy; SDB is never written."]
     if {$fn ne "" && $new_value ne ""} {
         lappend lines {*}[_v2_preview_lines [v2_preview $fn [list $edit_field $new_value]]]
     }
@@ -4430,14 +4448,14 @@ proc ::plugins::ShotHistoryEditor::v2_preview {filename changes} {
         dict set res message "no history_v2 copy of this shot; nothing to update"
         return $res
     }
-    if {[catch {
-        set fh [open $path r]
-        fconfigure $fh -encoding utf-8
-        set text [read $fh]
-        close $fh
-    } err]} {
-        if {[info exists fh]} { catch { close $fh } }
-        return [dict merge $res [dict create status error message "could not read it: $err"]]
+    # v0.24.1: read exactly as _v2_write reads it (bytes, plain UTF-8 only),
+    # so the preview never promises a change the Save then skips.
+    if {[catch { _read_bytes $path } raw]} {
+        return [dict merge $res [dict create status error message "could not read it: $raw"]]
+    }
+    set text [encoding convertfrom utf-8 $raw]
+    if {[encoding convertto utf-8 $text] ne $raw} {
+        return [dict merge $res [dict create status refused message "not plain UTF-8; left as it is"]]
     }
     # v0.23.2: a file the scanner or the check cannot handle is an error
     # status for the page, logged, never an error thrown into it.
@@ -4455,8 +4473,8 @@ proc ::plugins::ShotHistoryEditor::v2_preview {filename changes} {
 }
 
 # Bag Review's history_v2 sentence: how many of the files Save would change
-# have a copy (left as they are by this version; a later one updates the
-# changed fields). "" when no file changes.
+# have a copy (since v0.24.0 the Save updates the changed fields there too).
+# "" when no file changes.
 proc ::plugins::ShotHistoryEditor::_bag_v2_note {files} {
     set have 0 ; set of 0
     foreach f $files {
@@ -4584,8 +4602,10 @@ proc ::plugins::ShotHistoryEditor::_v2_write {ts filename changes backup_dir} {
     if {[catch { _write_bytes $tmp $bytes } err]} {
         return [dict merge $out [dict create status failed reason "temp file not written ($err); the .json untouched"]]
     }
-    if {[_read_bytes_or_empty $tmp] ne $bytes ||
-        [_v2_verify $text [encoding convertfrom utf-8 [_read_bytes_or_empty $tmp]] [dict get $p edits]] ne ""} {
+    # v0.24.1: byte for byte only -- these are the bytes _v2_verify passed
+    # above, so a second parse of the same bytes could never differ (one
+    # parse pass per write: a bag Save of many shots blocks the app less).
+    if {[_read_bytes_or_empty $tmp] ne $bytes} {
         return [dict merge $out [dict create status failed reason "temp file did not read back; the .json untouched"]]
     }
     if {[catch { file rename -force -- $tmp $path } err]} {
@@ -4636,7 +4656,7 @@ proc ::plugins::ShotHistoryEditor::_v2_result_line {r} {
         absent    { set s "history_v2: no copy of this shot; nothing to update." }
         skipped   { set s "$name: left as it is ([dict get $r reason]); the .shot change stands." }
         restore_failed { set s "$name: the write went wrong and could NOT be put back; the intact copy is [dict get $r backup]. The .shot change stands." }
-        default   { set s "$name: NOT updated ([dict get $r reason]); the .shot change stands." }
+        default   { set s "$name: NOT updated ([dict get $r reason]); the .shot change stands. Saving the same value again retries it." }
     }
     if {![_dget $r log_ok 1]} { append s " Its edit_log.txt line could not be written." }
     return $s
@@ -6825,6 +6845,10 @@ namespace eval ::plugins::ShotHistoryEditor {
     # so a lost reset can never block the buttons for good.
     variable bag_save_running 0
     variable bag_result_text ""
+    # v0.24.1: the bag Save's history_v2 queue ("" when none runs).
+    variable bag_v2_q ""
+    variable bag_v2_gen 0
+    variable bag_v2_last ""
     # 1 when the last Save wrote at least one file (Done then goes to Bags;
     # otherwise back to Edit bag with the edits kept).
     variable bag_result_wrote 0
@@ -7583,7 +7607,7 @@ proc ::plugins::ShotHistoryEditor::_bag_restore {path backup expected_raw why} {
 # folder is named; v0.18.0, for the next-shot preview log line).
 proc ::plugins::ShotHistoryEditor::perform_bag_save {plan} {
     set res [dict create ok 0 message "" written {} unchanged {} skipped {} failed {} \
-        restore_failed {} not_attempted {} backup_dir "" ts "" batch "" v2 {}]
+        restore_failed {} not_attempted {} backup_dir "" ts "" batch "" v2 {} v2_todo {} v2_changes {}]
     set blocker [_bag_save_blocker]
     if {$blocker eq ""} { set blocker [dict get $plan blocker] }
     if {$blocker ne ""} {
@@ -7625,6 +7649,7 @@ proc ::plugins::ShotHistoryEditor::perform_bag_save {plan} {
     set batch [_new_batch_id]
     dict set res ts $ts
     dict set res batch $batch
+    dict set res v2_changes $changes
     set dir [file join [backups_dir] "${ts}_${batch}_bag"]
     dict set res backup_dir $dir
     if {![_inside_backups_dir $dir] || [file exists $dir]} {
@@ -7676,10 +7701,11 @@ proc ::plugins::ShotHistoryEditor::perform_bag_save {plan} {
                     dict set res message [translate "edit_log.txt or edit_manifest.txt could not be written; stopped after this file."]
                     set stop 1
                 } else {
-                    # v0.24.0: the changed fields in this shot's history_v2
-                    # copy too; its result never stops or undoes the Save.
-                    set v [_v2_save $ts $fn $changes $dir]
-                    dict lappend res v2 [list $fn [dict get $v status] [dict get $v reason] [dict get $v backup] [_dget $v log_ok 1]]
+                    # v0.24.0: this shot's history_v2 copy gets the changed
+                    # fields too. v0.24.1: queued -- one file per event-loop
+                    # turn after the Save (_bag_v2_start), so a large bag
+                    # never freezes the app; never stops or undoes the Save.
+                    dict lappend res v2_todo $fn
                 }
             }
             unchanged { dict lappend res unchanged $fn }
@@ -7930,6 +7956,8 @@ proc ::plugins::ShotHistoryEditor::bag_confirm_submit {} {
         set note [_notify_downstream "the bag save"]
     }
     set bag_result_text [_bag_result_text $r $n $changed_identity $next $note]
+    # v0.24.1: the history_v2 copies follow, one per event-loop turn.
+    _bag_v2_start $r $n $changed_identity $next $note
     set bag_result_wrote [expr {[llength [dict get $r written]] > 0}]
     if {$bag_result_wrote} {
         # The bag may have a new name now: the editor starts over.
@@ -7963,7 +7991,17 @@ proc ::plugins::ShotHistoryEditor::bag_confirm_submit {} {
 # v0.24.0: the bag Save's history_v2 outcome, from the res v2 list (one
 # {filename status reason backup log_ok} per written .shot): one count line,
 # then any file that went wrong (a restore failure always, at most two others).
-proc ::plugins::ShotHistoryEditor::_bag_v2_summary {v2} {
+# v0.24.1: left = copies still queued: a progress line while they run.
+proc ::plugins::ShotHistoryEditor::_bag_v2_summary {v2 {left 0}} {
+    if {$left > 0} {
+        set done [llength $v2]
+        set lines [list "history_v2: [translate {updating the copies}], $done [translate of] [expr {$done + $left}] [translate {done... (the .shot changes are already saved)}]"]
+        foreach e $v2 {
+            lassign $e fn st why backup
+            if {$st eq "restore_failed"} { lappend lines "   history_v2/$fn.json: [translate {could NOT be put back; the intact copy is}] $backup" }
+        }
+        return $lines
+    }
     if {[llength $v2] == 0} { return {} }
     set n [dict create ok 0 unchanged 0 absent 0 skipped 0 failed 0 restore_failed 0]
     set bad {} ; set rf {} ; set log_bad 0
@@ -7983,8 +8021,87 @@ proc ::plugins::ShotHistoryEditor::_bag_v2_summary {v2} {
     if {$nf} { lappend parts "$nf [translate {NOT updated}]" }
     set lines [list "history_v2: [join $parts {, }] ([translate {the .shot changes stand; see edit_log.txt, V2 lines}])."]
     lappend lines {*}$rf {*}[lrange $bad 0 1]
+    # v0.24.1: a bag Save does not retry them (their .shot is up to date
+    # now, so a second Save finds nothing to change): say what does.
+    if {$nf || [dict get $n skipped]} {
+        lappend lines "   [translate {Those copies keep their old values until a later Save changes the same fields (edit_log.txt names them).}]"
+    }
     if {$log_bad} { lappend lines "   [translate {edit_log.txt could not take}] $log_bad V2 [translate line(s)]." }
     return $lines
+}
+
+# ---------------------------------------------------------------------------
+# v0.24.1 -- the bag Save's history_v2 queue. A 24-shot bag froze the app for
+# ~13 s on the tablet in v0.24.0 (every .json patched and checked inside the
+# Save). Now the Save writes, checks and logs every .shot as before and only
+# queues the history_v2 updates; then one file per event-loop turn goes
+# through the same _v2_save (every safety step unchanged), and the result
+# page shows the progress. While the queue runs every SHE write is refused
+# (_she_write_blocker, the move's plan), so nothing edits a file whose copy
+# is still pending. edit_log.txt: BAGSAVE V2 QUEUE (write-ahead) ... the V2
+# lines of each file ... BAGSAVE V2 END; a QUEUE without its END is a queue
+# the app stopped (its remaining copies keep the old values).
+# ---------------------------------------------------------------------------
+
+# How many history_v2 copies of the last bag Save are still queued.
+proc ::plugins::ShotHistoryEditor::_bag_v2_pending {} {
+    variable bag_v2_q
+    if {$bag_v2_q eq ""} { return 0 }
+    return [llength [dict get $bag_v2_q todo]]
+}
+
+# Starts the queue for a Save's result r (perform_bag_save: v2_todo,
+# v2_changes, ts, batch, backup_dir); ctx = the result page's other inputs.
+# Returns the queue's generation, 0 when there is nothing to queue.
+proc ::plugins::ShotHistoryEditor::_bag_v2_start {r n changed_identity next note} {
+    variable bag_v2_q
+    variable bag_v2_gen
+    set todo [_dget $r v2_todo {}]
+    if {[llength $todo] == 0} { return 0 }
+    incr bag_v2_gen
+    _bag_log "[dict get $r ts] BAGSAVE V2 QUEUE batch=[dict get $r batch] files=[llength $todo] fields=[join [dict keys [_dget $r v2_changes {}]] ,]"
+    set bag_v2_q [dict create gen $bag_v2_gen r $r todo $todo ctx [list $n $changed_identity $next $note]]
+    after 1 [list ::plugins::ShotHistoryEditor::_bag_v2_step $bag_v2_gen]
+    return $bag_v2_gen
+}
+
+# One queued copy, then the result page again; the next turn is scheduled
+# while any is left. An error here stops the queue (logged; the copies not
+# reached keep their old values and the result page says so).
+proc ::plugins::ShotHistoryEditor::_bag_v2_step {gen} {
+    variable bag_v2_q
+    variable bag_result_text
+    if {$bag_v2_q eq "" || [dict get $bag_v2_q gen] != $gen} { return }
+    set r [dict get $bag_v2_q r]
+    if {[catch {
+        set todo [dict get $bag_v2_q todo]
+        set fn [lindex $todo 0]
+        set v [_v2_save [dict get $r ts] $fn [dict get $r v2_changes] [dict get $r backup_dir]]
+        dict lappend r v2 [list $fn [dict get $v status] [dict get $v reason] [dict get $v backup] [_dget $v log_ok 1]]
+        set todo [lrange $todo 1 end]
+    } err]} {
+        msg -ERROR "ShotHistoryEditor: the bag Save's history_v2 queue stopped: $err"
+        foreach f [dict get $bag_v2_q todo] { dict lappend r v2 [list $f failed "not attempted: the queue stopped ($err)" "" 1] }
+        set todo {}
+    }
+    dict set r v2_todo $todo
+    dict set bag_v2_q r $r
+    dict set bag_v2_q todo $todo
+    lassign [dict get $bag_v2_q ctx] n changed_identity next note
+    set bag_result_text [_bag_result_text $r $n $changed_identity $next $note]
+    _paint_bag_result ShotHistoryEditor_bag_result
+    if {[llength $todo]} {
+        after 1 [list ::plugins::ShotHistoryEditor::_bag_v2_step $gen]
+        return
+    }
+    set c [dict create]
+    foreach e [dict get $r v2] { dict incr c [lindex $e 1] }
+    set counts {}
+    dict for {k v} $c { lappend counts "$k=$v" }
+    _bag_log "[dict get $r ts] BAGSAVE V2 END batch=[dict get $r batch] [join $counts { }]"
+    variable bag_v2_last
+    set bag_v2_last $r
+    set bag_v2_q ""
 }
 
 # next = the _bag_next_apply result ("" or 0: none).
@@ -8025,7 +8142,7 @@ proc ::plugins::ShotHistoryEditor::_bag_result_text {r n changed_identity next n
         lappend lines {*}[_bag_next_lines $next]
     }
     if {$w > 0} {
-        lappend lines {*}[_bag_v2_summary [_dget $r v2 {}]]
+        lappend lines {*}[_bag_v2_summary [_dget $r v2 {}] [llength [_dget $r v2_todo {}]]]
         if {[llength $next] > 1 && [dict get $next status] eq "applied"} {
             lappend lines [translate "history/*.shot and, through DYE, your next-shot plan changed; SDB is never written by this plugin; Visualizer uploads keep the old values."]
         } else {
